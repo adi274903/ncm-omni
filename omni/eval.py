@@ -136,7 +136,15 @@ def run(cfg):
         # Name the arm from the checkpoint's OWN mask_mode, not from which file it sat in. A
         # pre-shift `block` run parked in run/train_block is the legacy arm, and must never be
         # reported as "level-parallel".
+        # A checkpoint written by the duplex trainer carries the SHARED run cfg, whose
+        # mask_mode is the default ("block") for both arms - so the recorded label can lie.
+        # The directory it was written to is the trainer's own naming and does not lie.
         mm = (meta.get("cfg", {}).get("model", {}) or {}).get("mask_mode", "?")
+        arm = key.split("_")[0]                      # block_ckpt -> block, ar_ckpt -> ar
+        if mm != "?" and mm != arm:
+            print(f"  !! {p} records mask_mode={mm!r} but lives in train_{arm}/ "
+                  f"- trusting the directory (a pre-fix duplex trainer saved the shared cfg)")
+            mm = arm
         if mm == "strict":
             name = "level-parallel(strict)"
         elif mm == "ar":
@@ -208,11 +216,17 @@ def run(cfg):
                     off, l = sched.offsets(m)[k], sched.level_len(m, k)
                     counts[(m, k)].update(z[m][keep][:, off:off + l].reshape(-1).tolist())
     else:                                             # shards gone: fall back, and say so
-        src = "held-out rows (INFLATED - no shards on disk)"
+        # --live writes no shards, so this is the NORMAL path for a duplex run, not an
+        # emergency one. Absent modalities are all-NULL padding after collate; counting them
+        # makes every level's floor the NULL rate (they all read exactly 0.6667) instead of
+        # the code distribution, and the model then looks broken against a made-up bar.
+        src = "held-out rows (no shards on disk - --live stream, present-masked)"
         for m in sched.modalities:
+            keep_b = batch["present"][m].cpu().numpy().astype(bool)
             for k in range(sched.K):
                 off, l = sched.offsets(m)[k], sched.level_len(m, k)
-                counts[(m, k)].update(batch["codes"][m][:, off:off + l].reshape(-1).tolist())
+                slot = batch["codes"][m][keep_b][:, off:off + l]
+                counts[(m, k)].update(slot.reshape(-1).tolist())
     freq = {key: c.most_common(1)[0][1] / max(sum(c.values()), 1)
             for key, c in counts.items() if c}
     baseline = sum(freq.values()) / max(len(freq), 1)

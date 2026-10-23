@@ -184,10 +184,14 @@ def run_duplex(cfg, smoke=None):
     bs = cfg.get("batch", 4)
     use_bf16 = dev == "cuda"
 
-    models, opts, sched = {}, {}, None
+    models, opts, sched, arm_cfg = {}, {}, None, {}
     for arm in arms:
         c = copy.deepcopy(cfg)
         c["model"]["mask_mode"] = arm
+        # The checkpoint must carry ITS arm's cfg: eval names an arm from mask_mode, and the
+        # shared run cfg says "block" (the default), which relabels both arms as the legacy
+        # leaky arm and lets the second one silently overwrite the first.
+        arm_cfg[arm] = c
         m, s = build(c)
         m.to(dev).train()
         models[arm] = m
@@ -256,7 +260,7 @@ def run_duplex(cfg, smoke=None):
             for arm in arms:
                 d = os.path.join(out_dir, f"train_{arm}")
                 os.makedirs(d, exist_ok=True)
-                torch.save({"model": models[arm].state_dict(), "cfg": cfg, "step": step},
+                torch.save({"model": models[arm].state_dict(), "cfg": arm_cfg[arm], "step": step},
                            os.path.join(d, f"step{step+1}.pt"))
 
     # The live-stream generator holds 20 open Hub readers and daemon pump threads. Never closing
@@ -273,7 +277,7 @@ def run_duplex(cfg, smoke=None):
     for arm in arms:
         d = os.path.join(out_dir, f"train_{arm}")
         os.makedirs(d, exist_ok=True)
-        torch.save({"model": models[arm].state_dict(), "cfg": cfg, "step": steps - 1},
+        torch.save({"model": models[arm].state_dict(), "cfg": arm_cfg[arm], "step": steps - 1},
                    os.path.join(d, "final.pt"))
         print("saved", os.path.join(d, "final.pt"))
     print(f"DUPLEX {steps} steps | {dt/max(1, steps):.2f} s/step for {len(arms)} arms "
