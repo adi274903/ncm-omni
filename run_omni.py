@@ -1,0 +1,212 @@
+"""One entry point for the whole omni pipeline: config -> data -> train -> val -> eval.
+
+    python run_omni.py check                     # invariants, no data needed
+    python run_omni.py produce  [--budget N]     # writes cfg/*.json then runs the producer
+    python run_omni.py train --smoke 10          # timing run, writes nothing
+    python run_omni.py train                     # full run + checkpoints
+    python run_omni.py eval                      # NFE-vs-quality table
+    python run_omni.py all --budget 20000        # produce in the background, wait, train, eval
+
+Both arms use the same schedule, vocab and model width; the only difference is the attention
+mask (`block` vs `ar`), which is what makes the comparison a matched-params comparison.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RUN = os.path.join(HERE, "run")
+
+
+def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
+    return dict(
+        sched=dict(base_len=dict(text=64, image=64, audio=96, video=32), K=6, R=2, null_code=0),
+        vocab=dict(text=257, image=257, audio=257, video=257),   # codebook_size + the NULL slot
+        model=dict(n_embd=384, n_layer=6, n_head=6, n_kv_head=2, dropout=0.0,
+                   qk_norm=True, mask_mode="block"),
+        train=dict(steps=2000, batch=8, lr=3e-4, warmup=100, wd=0.01, clip=1.0,
+                   log_every=10, eval_every=250, save_every=500),
+        produce=dict(out_dir=out, sample_budget=budget, shard_samples=64,
+                     max_ahead_shards=24, shuffle_buf=512, batch_docs=8, seed=3407,
+                     holdout=dict(text=32, image=24, audio=16, video=8),
+                     mix=dict(text_fineweb=0.42, text_wikitext=0.09, image_pokemon=0.09,
+                              image_flickr=0.18, audio_libri=0.09, audio_dummy=0.05,
+                              video_ucf=0.08),
+                     codebook_size=256, prefer_real=True,
+                     K=None, R=None, base_len=None),
+    )
+
+
+def write_cfgs(cfg, budget=None):
+    from omni.schedule import OmniSchedule
+    os.makedirs(os.path.join(RUN, "cfg"), exist_ok=True)
+    sch = cfg["sched"]
+    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"])
+    prod = dict(cfg["produce"])
+    if budget:
+        prod["sample_budget"] = budget
+    prod.update(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
+                codebook_size=cfg["produce"]["codebook_size"])
+    prod.setdefault("only_sources", None)
+    paths = dict(
+        produce=os.path.join(RUN, "cfg", "produce.json"),
+        train_block=os.path.join(RUN, "cfg", "train_block.json"),
+        train_ar=os.path.join(RUN, "cfg", "train_ar.json"),
+        eval=os.path.join(RUN, "cfg", "eval.json"),
+    )
+    json.dump(prod, open(paths["produce"], "w"), indent=2)
+
+    for arm, mode in (("train_block", "block"), ("train_ar", "ar")):
+        t = dict(cfg["train"])
+        t.update(sched=sch, vocab=cfg["vocab"],
+                 model=dict(cfg["model"], mask_mode=mode),
+                 out_dir=os.path.join(RUN, arm),
+                 shard_dir=prod["out_dir"],
+                 producer_log=os.path.join(RUN, "producer.log"),
+                 eval_files={g: os.path.join(prod["out_dir"], f"eval_{g}.npz")
+                             for g in prod["holdout"]},
+                 stream_timeout=1800)
+        json.dump(t, open(paths[arm], "w"), indent=2)
+
+    import glob
+    json.dump(dict(block_ckpt=os.path.join(RUN, "train_block", "final.pt"),
+                   ar_ckpt=os.path.join(RUN, "train_ar", "final.pt"),
+                   eval_files=sorted(glob.glob(os.path.join(prod["out_dir"], "eval_*.npz"))),
+                   n_samples=48, out=os.path.join(RUN, "eval_table.json")),
+              open(paths["eval"], "w"), indent=2)
+    print("wrote", ", ".join(paths.values()))
+    return paths
+
+
+def cmd_check(args):
+    import torch
+    from omni import model as M
+    from omni.data import collate, synthetic_batch
+    from omni.schedule import OmniSchedule
+    from omni.train import build, n_params
+
+    print("torch", torch.__version__, "| cuda", torch.cuda.is_available())
+    M.selfcheck()
+
+    cfg = default_cfg()
+    sch = cfg["sched"]
+    m, sched = build(dict(sched=sch, vocab=cfg["vocab"], model=cfg["model"]))
+    print(f"model: {n_params(m)/1e6:.2f}M params | packed {sched.total_len} positions/sample")
+    print(sched.describe())
+
+    b = synthetic_batch(sched, cfg["vocab"], B=3, present_all=False)
+    out = m(b)
+    print("logits:", {f"{k[0]}_L{k[1]}": tuple(v.shape) for k, v in list(out.items())[:4]}, "...")
+
+    prod = subprocess.run([sys.executable, "-m", "omni.producer", "--selfcheck",
+                           _write_tmp(prod_cfg_only(cfg))],
+                          cwd=HERE, capture_output=True, text=True)
+    print(prod.stdout[-800:] or prod.stderr[-800:])
+    assert prod.returncode == 0, "producer selfcheck failed"
+    print("PIPELINE CHECK OK")
+
+
+def prod_cfg_only(cfg):
+    from omni.schedule import OmniSchedule
+    sch = cfg["sched"]
+    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"])
+    p = {k: v for k, v in cfg["produce"].items() if k not in ("K", "R", "base_len")}
+    p.update(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
+             codebook_size=cfg["produce"]["codebook_size"], only_sources=None)
+    return p
+
+
+def _write_tmp(obj):
+    path = os.path.join(RUN, "cfg", "produce_selfcheck.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(obj, open(path, "w"), indent=2)
+    return path
+
+
+def cmd_produce(args):
+    cfg = default_cfg()
+    paths = write_cfgs(cfg, budget=args.budget)
+    os.makedirs(RUN, exist_ok=True)
+    log = open(os.path.join(RUN, "producer.log"), "w")
+    p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
+                         cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+    print("producer pid", p.pid, "-> ", os.path.join(RUN, "producer.log"))
+    if args.foreground:
+        p.wait()
+        return p.returncode
+    print("background; training can start once EVAL_READY exists")
+    return 0
+
+
+def cmd_train(args):
+    cfg = default_cfg()
+    paths = write_cfgs(cfg)
+    which = paths["train_ar"] if args.arm == "ar" else paths["train_block"]
+    cmd = [sys.executable, "-m", "omni.train", which]
+    if args.smoke:
+        cmd += ["--smoke", str(args.smoke)]
+    return subprocess.call(cmd, cwd=HERE)
+
+
+def cmd_eval(args):
+    cfg = default_cfg()
+    paths = write_cfgs(cfg)
+    return subprocess.call([sys.executable, "-m", "omni.eval", paths["eval"]], cwd=HERE)
+
+
+def cmd_all(args):
+    """Producer in the background, then wait for the held-out blocks, then both arms, then eval."""
+    cfg = default_cfg()
+    paths = write_cfgs(cfg, budget=args.budget)
+    os.makedirs(RUN, exist_ok=True)
+    stream_dir = cfg["produce"]["out_dir"]
+    log = open(os.path.join(RUN, "producer.log"), "w")
+    p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
+                         cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+    print("producer pid", p.pid)
+    t0 = time.time()
+    while not os.path.exists(os.path.join(stream_dir, "EVAL_READY")):
+        if p.poll() is not None:
+            print("producer exited early; tail:")
+            print("".join(open(os.path.join(RUN, "producer.log")).readlines()[-25:]))
+            return 1
+        if args.wait_timeout and time.time() - t0 > args.wait_timeout:
+            print(f"no held-out blocks after {args.wait_timeout}s; tail:")
+            print("".join(open(os.path.join(RUN, "producer.log")).readlines()[-25:]))
+            return 1
+        time.sleep(5)
+    print(f"EVAL_READY after {time.time() - t0:.0f}s")
+    rc = 0
+    for arm in ("block", "ar"):
+        cmd = [sys.executable, "-m", "omni.train", paths[f"train_{arm}"]]
+        if args.smoke:
+            cmd += ["--smoke", str(args.smoke)]
+        rc |= subprocess.call(cmd, cwd=HERE)
+    if not args.smoke:
+        rc |= subprocess.call([sys.executable, "-m", "omni.eval", paths["eval"]], cwd=HERE)
+    open(os.path.join(stream_dir, "STOP"), "w").write("1")     # let a back-pressured producer exit
+    p.terminate()
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["check", "produce", "train", "eval", "all", "cfg"])
+    ap.add_argument("--budget", type=int, default=None)
+    ap.add_argument("--smoke", type=int, default=0)
+    ap.add_argument("--arm", choices=["block", "ar"], default="block")
+    ap.add_argument("--foreground", action="store_true")
+    ap.add_argument("--wait-timeout", type=int, default=3600)
+    a = ap.parse_args()
+    if a.cmd == "cfg":
+        write_cfgs(default_cfg(), a.budget)
+        return 0
+    return {"check": cmd_check, "produce": cmd_produce, "train": cmd_train,
+            "eval": cmd_eval, "all": cmd_all}[a.cmd](a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,17 @@
+# shard buffer + logs + checkpoints are regenerated every run; never commit them
+run/
+*.npz
+*.log
+*.pt
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# vendored deps
+_deps/
+
+# local data / paper PDFs
+*.pdf
+*.txt
+!requirements.txt
