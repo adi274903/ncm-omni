@@ -202,6 +202,40 @@ class VideoPyramidCodec(Codec):
 
 
 # ------------------------------------------------------------------ audio
+def _mel_fb(n_mels: int, n_fft: int, sr: int) -> np.ndarray:
+    """[n_fft//2+1, n_mels] triangular mel filterbank (HTK scale)."""
+    def hz2mel(f):
+        return 2595.0 * np.log10(1.0 + np.asarray(f) / 700.0)
+
+    def mel2hz(m):
+        return 700.0 * (10.0 ** (np.asarray(m) / 2595.0) - 1.0)
+
+    hz = mel2hz(np.linspace(hz2mel(0.0), hz2mel(sr / 2), n_mels + 2))
+    bins = np.clip(np.floor((n_fft + 1) * hz / sr).astype(int), 0, n_fft // 2)
+    fb = np.zeros((n_fft // 2 + 1, n_mels), dtype=np.float32)
+    for i in range(n_mels):
+        l, c, r = bins[i], max(bins[i] + 1, bins[i + 1]), max(bins[i + 1] + 2, bins[i + 2])
+        l, c, r = min(l, n_fft // 2), min(c, n_fft // 2), min(r, n_fft // 2 + 1)
+        if c > l:
+            fb[l:c, i] = np.linspace(0, 1, c - l, endpoint=False)
+        if r > c:
+            fb[c:r, i] = np.linspace(1, 0, r - c, endpoint=False)
+    return fb
+
+
+def _mel_numpy(x: np.ndarray, sr, n_mels=32, n_fft=400, hop=160) -> np.ndarray:
+    """Log-mel without torchaudio, so a torch/torchaudio version skew cannot kill the pipeline."""
+    if sr and sr != 16000:
+        n = max(1, int(round(len(x) * 16000 / sr)))
+        x = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
+    if len(x) < n_fft:
+        x = np.pad(x, (0, n_fft - len(x)))
+    win = np.hanning(n_fft).astype(np.float32)
+    frames = np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop] * win
+    spec = np.abs(np.fft.rfft(frames, axis=1)).astype(np.float32) ** 2
+    return np.log(spec @ _mel_fb(n_mels, n_fft, 16000) + 1e-6).T          # [n_mels, T]
+
+
 class AudioMelPyramidCodec(Codec):
     """Waveform -> log-mel frames, one code per frame, levels = frame-rate pyramid.
 
@@ -221,16 +255,20 @@ class AudioMelPyramidCodec(Codec):
 
     def _mel(self, obj):
         wav, sr = obj
-        import torch
-        import torchaudio
-        w = torch.as_tensor(np.asarray(wav, dtype=np.float32)).flatten()
-        if w.numel() == 0:
+        x = np.asarray(wav, dtype=np.float32).flatten()
+        if x.size == 0:
             return np.zeros((self.n_mels, 1), dtype=np.float32)
-        if sr != 16000:
-            w = torchaudio.functional.resample(w, 16000 if sr is None else sr, 16000)
-        mel = torchaudio.transforms.MelSpectrogram(16000, n_fft=400, hop_length=160,
-                                                   n_mels=self.n_mels)(w)
-        return torch.log(mel + 1e-6).numpy()                                # [n_mels, T]
+        try:
+            import torch
+            import torchaudio
+            w = torch.as_tensor(x)
+            if sr and sr != 16000:
+                w = torchaudio.functional.resample(w, sr, 16000)
+            mel = torchaudio.transforms.MelSpectrogram(
+                16000, n_fft=400, hop_length=160, n_mels=self.n_mels)(w)
+            return torch.log(mel + 1e-6).numpy()                            # [n_mels, T]
+        except Exception:                          # torchaudio missing or built for another torch
+            return _mel_numpy(x, sr, n_mels=self.n_mels)
 
     def encode(self, obj):
         mel = self._mel(obj).T                                             # [T, n_mels]

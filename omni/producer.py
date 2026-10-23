@@ -32,11 +32,15 @@ def log(*a):
 
 
 # ------------------------------------------------------------------ sources
-def _s(name, **kw):
-    """Streaming loader, resolved lazily so one bad dataset id cannot kill the producer."""
+def _s(path, **kw):
+    """Streaming loader, resolved lazily so one bad dataset id cannot kill the producer.
+
+    `path` (not `name`) so callers can pass the config through the `name=` keyword the way
+    load_dataset spells it: _s("hf-internal-testing/librispeech_asr_dummy", name="clean").
+    """
     def load():
         from datasets import load_dataset
-        return load_dataset(name, split="train", streaming=True, **kw)
+        return load_dataset(path, split="train", streaming=True, **kw)
     return load
 
 

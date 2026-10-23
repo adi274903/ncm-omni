@@ -34,10 +34,11 @@ class OmniSchedule:
         assert self.R >= 2 and self.K >= 1
         for m in self.modalities:
             assert m in self.base_len, m
-        # the level schedule must be monotone: coarser levels are never longer
+        # level 0 is the COARSEST (short) and level K-1 the finest (== base_len), so lengths must
+        # be non-decreasing in k. Getting this direction wrong is exactly what `check` caught.
         for m in self.modalities:
             lens = self.level_lens(m)
-            assert all(b <= a for a, b in zip(lens, lens[1:])), (m, lens)
+            assert all(a <= b for a, b in zip(lens, lens[1:])), (m, lens)
 
     # ---------------------------------------------------------------- geometry
     def level_len(self, m: str, k: int) -> int:
@@ -68,7 +69,6 @@ class OmniSchedule:
             c += l
         return tuple(out)
 
-    @property
     def flat_len(self, m: str) -> int:
         return sum(self.level_lens(m))
 
