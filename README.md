@@ -54,6 +54,19 @@ The model imports `Block`, `RMSNorm`, `precompute_rope_cos_sin`, `HAS_FLEX` from
    and logs the failures, so a renamed dataset costs the video group and nothing else. Video
    needs `av` (or pre-decoded frames) in the dataset; if the decode fails the sample is dropped.
 
+## Running on Colab
+
+The package is cloned from the private repo, never uploaded by hand:
+
+```
+!git clone --depth 1 https://x-access-token:$GITHUB_TOKEN@github.com/adi274903/ncm-omni.git /content/ncm_omni
+```
+
+`NCM_Omni_Stream.ipynb` cell 1 does exactly that, reading `GITHUB_TOKEN` from a Colab secret
+(key icon, left sidebar), then from the environment, then from `gh auth token`. It strips the
+token from the remote afterwards so nothing on disk keeps it. Re-running cell 1 becomes a
+`git pull --ff-only`, so a code change reaches Colab without losing the shard buffer.
+
 ## Honest status
 
 Authored, **not executed** (the machine that wrote it was off-limits for running). Every module
