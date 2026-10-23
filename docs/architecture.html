@@ -1,0 +1,189 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --ink: var(--foreground, #111); --dim: var(--muted-foreground, #666);
+          --line: var(--border, #d4d4d8); --card: var(--card, #fafafa); --acc: var(--accent, #2563eb); }
+  body { color: var(--ink); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; margin: 0; }
+  .wrap { width: 860px; }
+  h2 { font-size: 12px; letter-spacing: .10em; text-transform: uppercase; color: var(--dim);
+       font-weight: 600; margin: 22px 0 10px; }
+  h2:first-child { margin-top: 0; }
+  .lane { display: grid; grid-template-columns: 84px 1fr; gap: 10px; align-items: start; margin-bottom: 8px; }
+  .lane > .tag { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--dim);
+                 padding-top: 5px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip { border: 1px solid var(--line); border-radius: 5px; padding: 3px 7px; font-size: 11.5px;
+          background: var(--card); white-space: nowrap; }
+  .chip b { font-weight: 600; }
+  .chip .w { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .chip.math { border-left: 3px solid #7c3aed; }
+  .chip.sci  { border-left: 3px solid #0891b2; }
+  .chip.code { border-left: 3px solid #059669; }
+  .chip.gen  { border-left: 3px solid var(--acc); }
+  .row { display: grid; grid-template-columns: 84px 1fr; gap: 10px; margin: 8px 0; }
+  .step { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .box { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; background: var(--card); }
+  .box .k { font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--dim); }
+  .box .v { font-weight: 650; margin-top: 2px; }
+  .box .s { font-size: 11px; color: var(--dim); margin-top: 3px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .arrow { text-align: center; color: var(--dim); font-size: 15px; line-height: 1; margin: 4px 0; }
+
+  .bar { display: flex; height: 30px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg { display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600;
+         border-right: 1px solid var(--line); }
+  .seg:last-child { border-right: 0; }
+  .lvls { display: flex; height: 16px; margin-top: 4px; border-radius: 4px; overflow: hidden; }
+  .lv { border-right: 1px solid var(--line); display: flex; align-items: center; justify-content: center;
+        font-size: 9.5px; color: var(--dim); }
+  .lv:last-child { border-right: 0; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+  th { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim);
+       font-weight: 600; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .masks { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .mask { display: flex; gap: 12px; align-items: flex-start; }
+  .grid { display: grid; grid-template-columns: repeat(12, 11px); grid-template-rows: repeat(12, 11px); gap: 1px; }
+  .cell { border-radius: 1px; }
+  .on { background: var(--acc); opacity: .82; }
+  .off { background: var(--line); opacity: .30; }
+  .cap { font-size: 11.5px; }
+  .cap b { display: block; margin-bottom: 3px; }
+  .cap span { color: var(--dim); }
+  .note { font-size: 11.5px; color: var(--dim); margin-top: 6px; }
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; font-size: 11.5px;
+          background: var(--card); }
+  .grow { flex: 1 1 auto; height: 1px; background: var(--line); min-width: 12px; }
+  code { font-family: ui-monospace, monospace; font-size: 11.5px; background: var(--card);
+         border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h2>1 · data path — 20 HF streams, nothing downloaded</h2>
+
+  <div class="lane">
+    <div class="tag">TEXT 0.70</div>
+    <div class="chips">
+      <span class="chip gen"><b>fineweb-edu</b> <span class="w">.14</span></span>
+      <span class="chip gen"><b>cosmopedia-v2</b> <span class="w">.08</span></span>
+      <span class="chip gen"><b>wikipedia</b> <span class="w">.05</span></span>
+      <span class="chip math"><b>open-web-math</b> <span class="w">.08</span></span>
+      <span class="chip math"><b>finemath-3plus</b> <span class="w">.07</span></span>
+      <span class="chip math"><b>NuminaMath-CoT</b> <span class="w">.06</span></span>
+      <span class="chip sci"><b>arxiv-summarization</b> <span class="w">.07</span></span>
+      <span class="chip code"><b>codeparrot-clean</b> <span class="w">.10</span></span>
+      <span class="chip code"><b>Magicoder-instruct</b> <span class="w">.05</span></span>
+    </div>
+  </div>
+
+  <div class="lane">
+    <div class="tag">VISION 0.20</div>
+    <div class="chips">
+      <span class="chip"><b>DocumentVQA</b> <span class="w">.05</span></span>
+      <span class="chip"><b>ImageNet-1k 256</b> <span class="w">.05</span></span>
+      <span class="chip"><b>COCO</b> <span class="w">.04</span></span>
+      <span class="chip"><b>wikiart</b> <span class="w">.03</span></span>
+      <span class="chip"><b>oxford-flowers</b> <span class="w">.02</span></span>
+      <span class="chip"><b>food101</b> <span class="w">.01</span></span>
+    </div>
+  </div>
+
+  <div class="lane">
+    <div class="tag">AUDIO 0.08<br>VIDEO 0.02</div>
+    <div class="chips">
+      <span class="chip"><b>librispeech</b> clean/100 <span class="w">.03</span></span>
+      <span class="chip"><b>libritts_r</b> 24k <span class="w">.02</span></span>
+      <span class="chip"><b>fleurs</b> en_us <span class="w">.02</span></span>
+      <span class="chip"><b>peoples_speech</b> micro <span class="w">.01</span></span>
+      <span class="chip"><b>kinetics-mini</b> <span class="w">.02</span> <span class="w">(data only)</span></span>
+    </div>
+  </div>
+  <div class="note">All <code>streaming=True</code>. Audio/video cast to <code>decode=False</code>; bytes go to soundfile / PyAV, so no torchcodec. One <code>hf_hub_download</code> per video clip is the only disk write.</div>
+
+  <div class="arrow">↓</div>
+
+  <div class="step">
+    <div class="box"><div class="k">extract</div><div class="v">field-aware</div>
+      <div class="s"><code>text</code> · <code>problem+solution</code> · <code>image+question</code> · <code>audio→(wav,sr)</code> · <code>clip→8 frames</code></div></div>
+    <div class="box"><div class="k">codec</div><div class="v">4 discrete ladders</div>
+      <div class="s">byte · RGB pyramid · log-mel pyramid · frame pyramid — <b>256 codes each</b></div></div>
+    <div class="box"><div class="k">levels</div><div class="v">K=6, R=2</div>
+      <div class="s">level k = whole sample at 1/2<sup>5−k</sup> resolution, coarsest first</div></div>
+    <div class="box"><div class="k">pack</div><div class="v num">504 positions</div>
+      <div class="s">codes 1-based, 0 = NULL, vocab 257</div></div>
+  </div>
+
+  <div class="note" style="margin-top:10px">One sample = every modality's ladder concatenated. Level lengths double each step, so the finest level is the only full-resolution one.</div>
+
+  <table style="margin-top:6px">
+    <tr><th>modality</th><th class="n">level 0 → 5</th><th class="n">codes</th><th class="n">positions</th></tr>
+    <tr><td>text</td><td class="n">2 · 4 · 8 · 16 · 32 · 64</td><td class="n">126</td><td class="n">0–125</td></tr>
+    <tr><td>image</td><td class="n">2 · 4 · 8 · 16 · 32 · 64</td><td class="n">126</td><td class="n">126–251</td></tr>
+    <tr><td>audio</td><td class="n">3 · 6 · 12 · 24 · 48 · 96</td><td class="n">189</td><td class="n">252–440</td></tr>
+    <tr><td>video</td><td class="n">1 · 2 · 4 · 8 · 16 · 32</td><td class="n">63</td><td class="n">441–503</td></tr>
+  </table>
+
+  <h2>2 · what the producer writes</h2>
+  <div class="flow">
+    <span class="pill">sample → holdout if group not full</span><span class="grow"></span>
+    <span class="pill">shuffle buf 512</span><span class="grow"></span>
+    <span class="pill">shard_%06d.npz · 64 samples</span><span class="grow"></span>
+    <span class="pill">≤ 24 shards ahead</span><span class="grow"></span>
+    <span class="pill">EVAL_READY → DONE</span>
+  </div>
+  <div class="note">Held-out blocks are written <b>first</b> (text 32 · image 24 · audio 16 · video 8) so eval exists before the first shard. Shards are never deleted: both arms must read the same rows. Re-running resumes from the seed + sample count, it does not restart.</div>
+
+  <h2>3 · one model, two masks — everything else identical</h2>
+  <div class="masks">
+    <div class="mask">
+      <div class="grid" id="g-block"></div>
+      <div class="cap"><b>level-parallel · <code>mask_mode=block</code></b>
+        <span>Each level attends only inside itself. All codes of a level are emitted in one forward pass ⇒ <b class="num">6 NFE</b> for the whole sample, any modality. Attention FLOPs scale with Σl<sub>k</sub>², not (Σl<sub>k</sub>)².</span></div>
+    </div>
+    <div class="mask">
+      <div class="grid" id="g-ar"></div>
+      <div class="cap"><b>autoregressive · <code>mask_mode=ar</code></b>
+        <span>Causal over the same 504 positions ⇒ one forward pass per token, capped at T/2 in eval. Same params, same schedule, same vocab — the mask is the only difference, which is what makes the comparison matched.</span></div>
+    </div>
+  </div>
+
+  <div class="step" style="margin-top:12px">
+    <div class="box"><div class="k">body</div><div class="v num">6 layers · d384 · 6 heads</div><div class="s">GQA 2 KV heads · QK-norm · dropout 0</div></div>
+    <div class="box"><div class="k">params</div><div class="v num">10.44 M</div><div class="s">both arms, by construction</div></div>
+    <div class="box"><div class="k">token id</div><div class="v">code + modality + level</div><div class="s">position = index within its level</div></div>
+    <div class="box"><div class="k">loss</div><div class="v">CE per position</div><div class="s">−100 ignores absent modalities; every level supervised</div></div>
+  </div>
+
+  <h2>4 · the loop</h2>
+  <div class="flow">
+    <span class="pill">check <span class="w">7 invariants + 4 codecs, no data</span></span><span class="grow"></span>
+    <span class="pill">produce <span class="w">background</span></span><span class="grow"></span>
+    <span class="pill">train block</span><span class="grow"></span>
+    <span class="pill">train ar</span><span class="grow"></span>
+    <span class="pill">eval: quality vs NFE</span>
+  </div>
+  <div class="note">Eval decodes greedily and scores exact match against the frozen codec codes, per level: coarse level 0 has 2–3 positions, finest has 64–96. The claim under test — level-parallel reaches the AR arm's quality at NFE=6 — is <b>not yet measured</b>; everything above it is plumbing that has run.</div>
+
+</div>
+<script>
+  function mask(el, fn, n = 12) {
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+      const d = document.createElement("div");
+      d.className = "cell " + (fn(r, c) ? "on" : "off");
+      el.appendChild(d);
+    }
+  }
+  // block: 6 level-blocks of 2 cells each -> visible block-diagonal
+  mask(document.getElementById("g-block"), (r, c) => Math.floor(r / 2) === Math.floor(c / 2));
+  mask(document.getElementById("g-ar"), (r, c) => c <= r);
+</script>
+</body>
+</html>
