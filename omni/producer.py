@@ -87,6 +87,43 @@ def _txt(ex):
     return {}
 
 
+def _two(*keys):
+    """Join the first two non-empty string fields: problem+solution, question+answer, prompt+response.
+
+    Math, physics and code corpora all split the source material across paired fields; reading only
+    `text` on those datasets yields nothing at all.
+    """
+    def fmt(ex):
+        parts = []
+        for k in keys:
+            v = ex.get(k)
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip())
+            elif isinstance(v, list) and v and isinstance(v[0], str):
+                parts.append(v[0].strip())
+        return {"text": "\n\n".join(parts)} if parts else {}
+    return fmt
+
+
+def _img_text(img_keys=("image", "img"), cap_keys=("text", "caption", "captions", "alt_text",
+                                                   "question", "label")):
+    """Image + the best available string beside it. Field names differ across every vision set."""
+    def fmt(ex):
+        img = next((ex.get(k) for k in img_keys if ex.get(k) is not None), None)
+        if img is None:
+            return {}
+        for k in cap_keys:
+            v = ex.get(k)
+            if isinstance(v, str) and v.strip():
+                return {"image": img, "text": v.strip()}
+            if isinstance(v, dict):
+                inner = next((str(x) for x in v.values() if isinstance(x, str) and x.strip()), "")
+                if inner:
+                    return {"image": img, "text": inner}
+        return {"image": img}
+    return fmt
+
+
 def _img_cap(ex):
     img = ex.get("image")
     if img is None:
@@ -124,7 +161,8 @@ def _audio_text(ex):
     if wav is None:
         return {}
     t = ""
-    for k in ("text", "transcription", "transcript", "sentence"):
+    for k in ("text", "transcription", "transcript", "sentence", "text_normalized",
+              "text_original", "raw_transcription"):
         v = ex.get(k)
         if isinstance(v, str) and v.strip():
             t = v
@@ -181,24 +219,53 @@ def _video_frames(ex, max_frames=8):
 # name -> (loader, extractor). Anything that fails to open is skipped with a log line, so a stale
 # dataset id degrades the mixture instead of killing the run.
 #
-# Every id here was opened against the live Hub: the pokemon and flickr30k ids that used to sit
-# here are gated and script-based respectively, so neither streams at all any more.
+# Every id below was opened against the live Hub and its first record decoded (July..Oct 2026
+# Hub state). Pruned because they no longer stream at all: lambdalabs/pokemon-blip-captions
+# (gated), nlphuji/flickr30k, google/docci, facebook/textvqa, poloclub/diffusiondb, allenai/peS2o
+# (all script-based), bigcode/the-stack-smol (gated), huggingface/food101 (renamed ethz/food101),
+# HuggingFaceTB/smollm-corpus/python-edu (ships metadata only, no text column).
 SOURCES = {
-    "text_fineweb":   (_stream("HuggingFaceFW/fineweb-edu", "sample-10BT"), _txt),
-    "text_wikitext":  (_stream("Salesforce/wikitext", "wikitext-103-raw-v1"), _txt),
-    "image_cifar10":  (_s("uoft-cs/cifar10"), _img_cap),
-    "image_cifar100": (_s("uoft-cs/cifar100"), _img_cap),
-    "audio_dummy":    (_raw("hf-internal-testing/librispeech_asr_dummy", "clean", "validation",
-                            column="audio"), _audio_text),
-    "audio_libri":    (_raw("openslr/librispeech_asr", "clean", "train.100",
-                            column="audio"), _audio_text),
-    "video_ucf":      (_raw(["nateraw/kinetics-mini", "sayakpaul/ucf101-subset"],
-                            column="video"), _video_frames),
+    # --- general + educational text
+    "text_fineweb":     (_stream("HuggingFaceFW/fineweb-edu", "sample-10BT"), _txt),
+    "text_cosmopedia":  (_stream("HuggingFaceTB/smollm-corpus", "cosmopedia-v2"), _txt),
+    "text_wikipedia":   (_stream("wikimedia/wikipedia", "20231101.en"), _txt),
+    # --- math
+    "text_math_web":    (_stream("open-web-math/open-web-math"), _txt),
+    "text_math_fine":   (_stream("HuggingFaceTB/finemath", "finemath-3plus"), _txt),
+    "text_math_numina": (_stream("AI-MO/NuminaMath-CoT"), _two("problem", "solution")),
+    # --- physics / science papers
+    "text_arxiv":       (_stream("ccdv/arxiv-summarization"), _two("article", "abstract")),
+    # --- code
+    "text_code":        (_stream("codeparrot/codeparrot-clean"), _two("content")),
+    "text_code_inst":   (_stream("ise-uiuc/Magicoder-OSS-Instruct-75K"),
+                         _two("problem", "solution")),
+    # --- vision
+    "image_docvqa":     (_s("HuggingFaceM4/DocumentVQA"), _img_text()),
+    "image_imagenet":   (_s("evanarlian/imagenet_1k_resized_256"), _img_text()),
+    "image_coco":       (_s("detection-datasets/coco"), _img_text()),
+    "image_wikiart":    (_s("huggan/wikiart"), _img_text(cap_keys=("artist", "style", "genre"))),
+    "image_flowers":    (_s("nelorth/oxford-flowers"), _img_text()),
+    "image_food":       (_s("ethz/food101"), _img_text()),
+    # --- audio (always decode=False + soundfile)
+    "audio_libri":      (_raw("openslr/librispeech_asr", "clean", "train.100",
+                              column="audio"), _audio_text),
+    "audio_libritts":   (_raw("mythicinfinity/libritts_r", "clean", "train.clean.100",
+                              column="audio"), _audio_text),
+    "audio_fleurs":     (_raw("google/fleurs", "en_us", column="audio"), _audio_text),
+    "audio_peoples":    (_raw("MLCommons/peoples_speech", "microset", column="audio"),
+                         _audio_text),
+    # --- video (data path only; kinetics-mini streams, ucf101-subset is 2 clips)
+    "video_ucf":        (_raw(["nateraw/kinetics-mini", "sayakpaul/ucf101-subset"],
+                              column="video"), _video_frames),
 }
-GROUPS = {"text_fineweb": "text", "text_wikitext": "text",
-          "image_cifar10": "image", "image_cifar100": "image",
-          "audio_dummy": "audio", "audio_libri": "audio",
-          "video_ucf": "video"}
+GROUPS = {k: "text" for k in ("text_fineweb", "text_cosmopedia", "text_wikipedia",
+                              "text_math_web", "text_math_fine", "text_math_numina",
+                              "text_arxiv", "text_code", "text_code_inst")}
+GROUPS.update({k: "image" for k in ("image_docvqa", "image_imagenet", "image_coco",
+                                    "image_wikiart", "image_flowers", "image_food")})
+GROUPS.update({k: "audio" for k in ("audio_libri", "audio_libritts", "audio_fleurs",
+                                    "audio_peoples")})
+GROUPS["video_ucf"] = "video"
 
 
 class Source:
