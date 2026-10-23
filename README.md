@@ -67,6 +67,28 @@ The package is cloned from the private repo, never uploaded by hand:
 token from the remote afterwards so nothing on disk keeps it. Re-running cell 1 becomes a
 `git pull --ff-only`, so a code change reaches Colab without losing the shard buffer.
 
+## Three arms, and one that cheats
+
+Every position used to be fed **its own target code**, and that embedding sits in the residual
+stream, so the head could copy the answer with a linear map. The model learned identity: train
+loss hit `7.7e-09` in 2k steps, and at generation - where the input is NULL or a guess - it
+scored `0.122`, **below the constant-predictor baseline of `0.174`**. That run is void.
+
+`pack()` now shifts the input so no position can read its own target:
+
+| arm | input at a position | attention | status |
+|---|---|---|---|
+| `strict` | codes of level k-1, upsampled to l_k (level 0: NULL) | levels < k only | the honest parallel arm |
+| `ar` | code j-1 in raster order | causal | the honest AR arm |
+| `block` | its own level's codes | own level only | **legacy, leaks, do not quote** |
+
+`tests/test_shifted_input.py` asserts the contract: perturbing level k leaves level-k logits
+bit-identical, perturbing level k-1 moves them; for AR, perturbing code j leaves position j
+untouched and perturbing code j-1 moves it.
+
+`eval` also prints the constant-predictor baseline, computed from the training shards (absent
+modalities excluded). A score under it is not a result.
+
 ## Honest status
 
 Authored, **not executed** (the machine that wrote it was off-limits for running). Every module

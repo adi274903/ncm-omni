@@ -60,11 +60,13 @@ def write_cfgs(cfg, budget=None, steps=None):
         produce=os.path.join(RUN, "cfg", "produce.json"),
         train_block=os.path.join(RUN, "cfg", "train_block.json"),
         train_ar=os.path.join(RUN, "cfg", "train_ar.json"),
+        train_strict=os.path.join(RUN, "cfg", "train_strict.json"),
         eval=os.path.join(RUN, "cfg", "eval.json"),
     )
     json.dump(prod, open(paths["produce"], "w"), indent=2)
 
-    for arm, mode in (("train_block", "block"), ("train_ar", "ar")):
+    for arm, mode in (("train_block", "block"), ("train_ar", "ar"),
+                      ("train_strict", "strict")):
         t = dict(cfg["train"])
         if steps:
             t["steps"] = int(steps)
@@ -82,6 +84,7 @@ def write_cfgs(cfg, budget=None, steps=None):
     import glob
     json.dump(dict(block_ckpt=os.path.join(RUN, "train_block", "final.pt"),
                    ar_ckpt=os.path.join(RUN, "train_ar", "final.pt"),
+                   strict_ckpt=os.path.join(RUN, "train_strict", "final.pt"),
                    eval_files=sorted(glob.glob(os.path.join(prod["out_dir"], "eval_*.npz"))),
                    n_samples=48, out=os.path.join(RUN, "eval_table.json")),
               open(paths["eval"], "w"), indent=2)
@@ -152,7 +155,7 @@ def cmd_produce(args):
 def cmd_train(args):
     cfg = default_cfg()
     paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
-    which = paths["train_ar"] if args.arm == "ar" else paths["train_block"]
+    which = paths.get(f"train_{args.arm}") or paths["train_block"]
     cmd = [sys.executable, "-m", "omni.train", which]
     if args.smoke:
         cmd += ["--smoke", str(args.smoke)]
@@ -206,7 +209,7 @@ def main():
     ap.add_argument("--budget", type=int, default=None)
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--smoke", type=int, default=0)
-    ap.add_argument("--arm", choices=["block", "ar"], default="block")
+    ap.add_argument("--arm", choices=["block", "ar", "strict"], default="block")
     ap.add_argument("--foreground", action="store_true")
     ap.add_argument("--wait-timeout", type=int, default=3600)
     a = ap.parse_args()

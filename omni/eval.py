@@ -84,13 +84,33 @@ def summarise(acc, sched, n_levels):
                 finest=sum(fine) / max(1, len(fine)))
 
 
+ARMS = (("level-parallel", "block_ckpt"),            # legacy: sees its own level, do not quote
+        ("level-parallel(strict)", "strict_ckpt"),   # the honest parallel arm
+        ("autoregressive", "ar_ckpt"))
+
+
 def run(cfg):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    block, sched, ck = load_model(cfg["block_ckpt"], dev)
-    ar = None
-    if cfg.get("ar_ckpt") and os.path.exists(cfg["ar_ckpt"]):
-        ar, sched_ar, _ = load_model(cfg["ar_ckpt"], dev)
-        assert sched_ar.total_len == sched.total_len, "arms must share the schedule"
+    # Any subset of checkpoints may exist: eval on whatever has been trained, and say what is
+    # missing. A missing arm is a message, not a crash - the point is never to be blocked from
+    # reading the arm you do have.
+    loaded, sched, ck = {}, None, None
+    for name, key in ARMS:
+        p = cfg.get(key)
+        if not (p and os.path.exists(p)):
+            continue
+        mdl, sch, meta = load_model(p, dev)
+        if sched is None:
+            sched, ck = sch, meta
+        else:
+            assert sch.total_len == sched.total_len, "arms must share the schedule"
+        loaded[name] = mdl
+    assert loaded, ("no checkpoints found - train at least one arm "
+                    "(`run_omni.py train --arm strict`)")
+    print("arms found:", ", ".join(loaded))
+    block = loaded.get("level-parallel")
+    strict = loaded.get("level-parallel(strict)")
+    ar = loaded.get("autoregressive")
 
     files = [f for f in (cfg.get("eval_files") or []) if os.path.exists(f)]
     if not files:                                  # cfg was written before the producer ran
@@ -107,12 +127,49 @@ def run(cfg):
     print(f"eval on {len(rows)} held-out samples from {len(files)} group file(s) | "
           f"packed positions {sched.total_len}")
 
+    # A constant predictor (always emit the most frequent code of each slot) is the floor any
+    # real score has to clear: without it a 0.12 looks like signal when it is below the trivial
+    # solution. It must come from the TRAINING distribution - estimated on 48 held-out rows it
+    # reads ~0.62, because with 48 rows the modal code of a slot is "most of the slot".
+    from collections import Counter
+    import glob
+    import numpy as np
+    counts = {(m, k): Counter() for m in sched.modalities for k in range(sched.K)}
+    src = "training shards"
+    shards = sorted(glob.glob(os.path.join(ck["cfg"].get("shard_dir", ""), "shard_*.npz")))[:40]
+    if shards:
+        for f in shards:
+            z = np.load(f, allow_pickle=False)
+            for m in sched.modalities:
+                if m not in z:
+                    continue
+                # absent modalities are all-NULL padding; counting them makes the baseline the
+                # NULL rate, not the code distribution
+                keep = z[f"{m}_present"].astype(bool) if f"{m}_present" in z else np.ones(len(z[m]), bool)
+                if not keep.any():
+                    continue
+                for k in range(sched.K):
+                    off, l = sched.offsets(m)[k], sched.level_len(m, k)
+                    counts[(m, k)].update(z[m][keep][:, off:off + l].reshape(-1).tolist())
+    else:                                             # shards gone: fall back, and say so
+        src = "held-out rows (INFLATED - no shards on disk)"
+        for m in sched.modalities:
+            for k in range(sched.K):
+                off, l = sched.offsets(m)[k], sched.level_len(m, k)
+                counts[(m, k)].update(batch["codes"][m][:, off:off + l].reshape(-1).tolist())
+    vals = [c.most_common(1)[0][1] / max(sum(c.values()), 1) for c in counts.values() if c]
+    baseline = sum(vals) / max(len(vals), 1)
+    print(f"constant-predictor baseline from {src} = {baseline:.4f}")
+
     table = []
-    for kp in range(1, sched.K + 1):
-        acc = score_codes(block, sched, batch, level_cutoff=kp)
-        s = summarise(acc, sched, kp)
-        s.update(arm="level-parallel", nfe=kp, levels=kp)
-        table.append(s)
+    for name, model in (("level-parallel", block), ("level-parallel(strict)", strict)):
+        if model is None:
+            continue
+        for kp in range(1, sched.K + 1):
+            acc = score_codes(model, sched, batch, level_cutoff=kp)
+            s = summarise(acc, sched, kp)
+            s.update(arm=name, nfe=kp, levels=kp)
+            table.append(s)
 
     if ar is not None:
         T = sum(sched.flat_len(m) for m in sched.modalities)
@@ -125,17 +182,22 @@ def run(cfg):
             s = summarise(acc, sched, sched.K)
             s.update(arm="autoregressive", nfe=b, levels=None)
             table.append(s)
-    else:
+    if strict is None:
+        print("no strict checkpoint: the honest parallel arm has not been trained yet "
+              "(`run_omni.py train --arm strict`)")
+    if ar is None:
         print("no AR checkpoint: the comparison table will be one-sided "
               "(train one with model.mask_mode='ar' on the same shards)")
 
-    print("\n| arm | NFE | mean acc | coarse | finest |")
+    print(f"\nconstant predictor = {baseline:.4f}\n")
+    print("| arm | NFE | mean acc | coarse | finest |")
     print("|---|---|---|---|---|")
     for r in sorted(table, key=lambda r: (r["arm"], r["nfe"])):
         print(f"| {r['arm']} | {r['nfe']} | {r['mean']:.4f} | {r['coarse']:.4f} | {r['finest']:.4f} |")
 
     # the one-line reading of the table
-    lp = {r["nfe"]: r["mean"] for r in table if r["arm"] == "level-parallel"}
+    mine = "level-parallel(strict)" if strict is not None else "level-parallel"
+    lp = {r["nfe"]: r["mean"] for r in table if r["arm"] == mine}
     if ar is not None:
         arm = {r["nfe"]: r["mean"] for r in table if r["arm"] == "autoregressive"}
         target = lp.get(sched.K, 0.0)

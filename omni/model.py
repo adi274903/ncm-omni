@@ -71,6 +71,12 @@ def trunc_mask(sched: OmniSchedule, T: int, dtype=torch.float32, device="cpu",
         # raster order: everything strictly before, plus the prefix
         idx = torch.arange(T, device=device)
         allowed = idx[None, :] <= idx[:, None]
+    elif mask_mode == "strict":
+        # Generation reality: every code of level k is emitted in ONE forward pass, so no position
+        # may see a sibling of its own level. Level k attends to levels < k only. Level 0 has no
+        # coarser level, so it attends to its own block - which pack() always fills with NULL, at
+        # train time too, so there is nothing to copy there either.
+        allowed = (kv == -1) | ((q == 0) & (kv == 0)) | ((kv >= 0) & (kv < q))
     else:
         allowed = (kv == -1) | (kv == q)
         if cross_level:
@@ -93,6 +99,8 @@ def trunc_flex(sched: OmniSchedule, B: int, H: int, T: int, device="cuda",
         if mask_mode == "ar":
             return kv_idx <= q_idx
         ql, kl = lev[q_idx], lev[kv_idx]
+        if mask_mode == "strict":
+            return (kl == -1) | ((ql == 0) & (kl == 0)) | ((kl >= 0) & (kl < ql))
         allowed = (kl == -1) | (kl == ql)
         if cross_level:
             allowed = allowed | ((ql >= 0) & (kl >= 0) & (kl < ql))
@@ -131,19 +139,48 @@ class OmniNCM(nn.Module):
              dummy_level: Optional[int] = None):
         """codes[m] = [B, flat_len(m)] -> packed [B, T, d] over levels < upto.
 
-        dummy_level: build that level with zero codes (generation), so its positions exist and
-        we can read their logits.
+        The packed input at a position is NEVER that position's own target code, in either mode:
+
+          * `strict` (level-parallel): level k is fed the codes of level k-1, upsampled to l_k.
+            Level 0 is fed NULL - it has no coarser level, so it is a prior over the coarsest
+            codes and nothing else.
+          * `ar`: the raster-shifted sequence, i.e. position j is fed code j-1.
+
+        Without that shift the head can read its own input token straight out of the residual
+        stream (the token embedding is in `h` by construction), so the model learns an identity
+        map: train loss -> 1e-8, and at generation - where the input is NULL or a guess - it
+        emits garbage, scoring BELOW a constant predictor. `block` keeps the old (leaky) layout
+        for comparison and should not be quoted.
         """
         S, K = self.sched, self.sched.K
         B = next(iter(codes.values())).size(0)
         stop = K if upto is None else upto
+        mode = self.cfg.mask_mode
+        shifted = {}
+        if mode == "ar":                                  # position j is fed code j-1
+            for m in S.modalities:
+                c = codes[m]
+                shifted[m] = torch.cat([torch.zeros(B, 1, dtype=c.dtype, device=c.device),
+                                        c[:, :-1]], -1)
         parts, conds = [], {}
         for k in range(spread(stop, dummy_level)):
             block = []
             for m in S.modalities:
                 l = S.level_len(m, k)
                 off = S.offsets(m)[k]
-                if dummy_level is not None and k == dummy_level:
+                if mode == "strict":
+                    if k == 0:
+                        c = torch.zeros(B, l, dtype=torch.long, device=self._dev)
+                    else:
+                        prev = codes[m][:, S.offsets(m)[k - 1]:S.offsets(m)[k]]
+                        lp = prev.size(-1)
+                        idx = (torch.arange(l, device=prev.device) * lp) // l   # nearest neighbour
+                        c = prev[:, idx]
+                    if dummy_level is not None and k > dummy_level:
+                        c = torch.zeros(B, l, dtype=torch.long, device=self._dev)
+                elif mode == "ar":
+                    c = shifted[m][:, off:off + l]
+                elif dummy_level is not None and k == dummy_level:
                     c = torch.zeros(B, l, dtype=torch.long, device=self._dev)
                 else:
                     c = codes[m][:, off:off + l]
