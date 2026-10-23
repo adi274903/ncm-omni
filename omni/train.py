@@ -286,9 +286,10 @@ def run_duplex(cfg, smoke=None):
     # "DUPLEX ... steps" with every checkpoint already on disk. This must come after the
     # save flush and before any early return (--smoke used to return here and hang the same
     # way). Everything is on disk by now; leave hard rather than hang a finished run.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    if cfg.get("hard_exit", True):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 def main():

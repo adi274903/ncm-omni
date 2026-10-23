@@ -305,6 +305,14 @@ def cmd_train(args):
         which = os.path.join(RUN, "cfg", "train_duplex.json")
         json.dump(tcfg, open(which, "w"), indent=1)
         print(f"duplex: arms {arms} | live stream, no shards | out {RUN}")
+    if getattr(args, "inproc", False):
+        # In a notebook the subprocess buys nothing and costs a second interpreter: `pip` lands in
+        # the kernel's python, the subprocess may resolve a different one, and the hard exit that
+        # exists only to escape the subprocess would kill the kernel. Call the loop directly.
+        from omni.train import run_duplex
+        tcfg["hard_exit"] = False
+        print("in-process: hard exit disabled, the cell keeps running after the last step")
+        return run_duplex(tcfg, smoke=args.smoke or None)
     cmd = [sys.executable, "-m", "omni.train", which]
     if args.smoke:
         cmd += ["--smoke", str(args.smoke)]
@@ -352,13 +360,17 @@ def cmd_all(args):
     return rc
 
 
-def main():
+def main(argv=None):
+    """argv=None keeps the CLI; a notebook passes a list and never leaves the kernel."""
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["check", "produce", "train", "eval", "all", "cfg"])
     ap.add_argument("--budget", type=int, default=None)
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--smoke", type=int, default=0)
     ap.add_argument("--arm", choices=["block", "ar", "strict"], default="block")
+    ap.add_argument("--inproc", action="store_true",
+                    help="run the duplex loop in this process instead of spawning a trainer; use "
+                         "from a notebook so the kernel's python, packages and output are kept")
     ap.add_argument("--live", action="store_true",
                     help="feed the duplex run from the Hub directly instead of shards. Measured "
                          "1.5 samples/s in one process vs 45 for a sharded producer, so this is "
@@ -384,7 +396,7 @@ def main():
                     help="producer rolling-buffer cap in shards; 0 keeps the default 24, "
                          "which blocks forever when nothing deletes shards (batch runs: 100000)")
     ap.add_argument("--wait-timeout", type=int, default=3600)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.cmd == "cfg":
         write_cfgs(apply_overrides(default_cfg(), a), a.budget)
         return 0
