@@ -15,3 +15,7 @@ _deps/
 *.pdf
 *.txt
 !requirements.txt
+
+# local venv created by uv for on-machine verification
+.venv/
+_probe*.py
