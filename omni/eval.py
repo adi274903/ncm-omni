@@ -31,10 +31,12 @@ def load_model(path, dev="cuda"):
 @torch.no_grad()
 def score_codes(model, sched, batch, level_cutoff=None, temp=0.0):
     """Greedy level-parallel sample; returns per-(m,k) exact-match accuracy."""
-    # Dense SDPA: eval is 48 sequences, so a fused kernel buys nothing, and flex's
-    # per-level shapes (l_0 != l_5) blow the Dynamo cache and fall back to eager anyway.
+    # Auto-select the attention path. At base_len=64 eval is 48 sequences of 504 positions, where
+    # dense SDPA is fine; at base_len=1024 the packed sequence is ~7.1k, and a dense T x T mask
+    # (50M floats) pushes SDPA onto a path that materialises B*H*T*T scores -> OOM. encode() gates
+    # flex on sm_80+, so a T4 still gets dense and an A100/3070 gets the fused kernel.
     gen = model.generate(batch, level_cutoff=level_cutoff, temperature=temp,
-                         use_flex=False)
+                         use_flex=None)
     K = sched.K if level_cutoff is None else level_cutoff
     acc = {}
     for k in range(K):
@@ -52,7 +54,7 @@ def score_codes(model, sched, batch, level_cutoff=None, temp=0.0):
 def ar_scores(model, sched, batch, token_budgets):
     """Greedy AR sample up to the largest budget; score only the positions that budget covers."""
     budgets = sorted(set(int(b) for b in token_budgets))
-    gen, _ = model.generate_ar(batch, max_len=budgets[-1], use_flex=False)
+    gen, _ = model.generate_ar(batch, max_len=budgets[-1], use_flex=None)
     # raster order index of every (modality, level, position) is what "token budget" means
     order = [(k, m, i) for k in range(sched.K) for m in sched.modalities
              for i in range(sched.level_len(m, k))]
@@ -85,7 +87,7 @@ def cond_scores(model, sched, batch):
     flip. Conditional accuracy asks the question the architecture actually answers: given the
     coarser levels, how much of level k do you reconstruct in ONE pass?
     """
-    logits = model(batch, use_flex=False)
+    logits = model(batch, use_flex=None)
     acc = {}
     for k in range(sched.K):
         for m in sched.modalities:

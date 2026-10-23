@@ -21,6 +21,48 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUN = os.path.join(HERE, "run")
 
 
+# Model/optimiser presets. Parameter counts are measured, not nominal: at base_len=1024 the
+# positional table is 1025 x d, so the same width counts for more than it does at 64.
+#   sm  10.44M  d384  L6  h6  kv2     -> the debug harness that produced the 10M result
+#   md  84.6M   d768  L13 h12 kv3     -> the kill test rung
+#   lg  454.1M  d1536 L18 h16 kv4     -> the paper number, rented H100 only
+PRESETS = {
+    "sm": dict(n_embd=384,  n_layer=6,  n_head=6,  n_kv_head=2, batch=8,  lr=3e-4,   warmup=100),
+    "md": dict(n_embd=768,  n_layer=13, n_head=12, n_kv_head=3, batch=8,  lr=2e-4,   warmup=200),
+    "lg": dict(n_embd=1536, n_layer=18, n_head=16, n_kv_head=4, batch=8,  lr=1.5e-4, warmup=300),
+}
+
+
+def apply_overrides(cfg, a):
+    """Preset dims, schedule length, eval-set size. Every command goes through here, because
+    each one rewrites run/cfg/*.json - a mismatch between produce and train would silently
+    train on a schedule the shards were not encoded with."""
+    preset = getattr(a, "preset", None)
+    if preset and preset in PRESETS:
+        p = PRESETS[preset]
+        cfg["model"].update({k: p[k] for k in ("n_embd", "n_layer", "n_head", "n_kv_head")})
+        cfg["train"].update(batch=p["batch"], lr=p["lr"], warmup=p["warmup"])
+    if getattr(a, "batch", 0):
+        cfg["train"]["batch"] = int(a.batch)
+    n = getattr(a, "base_len", 0)
+    if n:
+        r = n / 64.0                       # 64 is the reference text/image length
+        cfg["sched"]["base_len"] = dict(text=int(n), image=int(n),
+                                        audio=max(4, int(round(96 * r / 4)) * 4),
+                                        video=32)
+        # video stays at 32: its base_len is frames x grid^2, so 512 would read 128 frames of
+        # every clip. It is data-path only and currently dead in eval, so it is not worth the
+        # decode. Raise it in build_codec if that ever changes.
+    m = getattr(a, "holdout_mult", 0)
+    if m:
+        cfg["produce"]["holdout"] = {k: int(v * m) for k, v in cfg["produce"]["holdout"].items()}
+    return cfg
+
+
+def write_cfgs_all(cfg, budget=None, steps=None):
+    return write_cfgs(cfg, budget=budget, steps=steps)
+
+
 def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
     return dict(
         sched=dict(base_len=dict(text=64, image=64, audio=96, video=32), K=6, R=2, null_code=0),
@@ -145,7 +187,7 @@ def _nshards(d):
 
 
 def cmd_produce(args):
-    cfg = default_cfg()
+    cfg = apply_overrides(default_cfg(), args)
     # ShardStream reads with consume=False, so shard files are never deleted: the rolling-buffer
     # cap (max_ahead_shards) can only ever block forever once it is hit. Batch production wants
     # the whole corpus on disk, so allow the cap to be raised explicitly.
@@ -235,7 +277,7 @@ def cmd_produce(args):
 
 
 def cmd_train(args):
-    cfg = default_cfg()
+    cfg = apply_overrides(default_cfg(), args)
     paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
     which = paths.get(f"train_{args.arm}") or paths["train_block"]
     cmd = [sys.executable, "-m", "omni.train", which]
@@ -245,14 +287,14 @@ def cmd_train(args):
 
 
 def cmd_eval(args):
-    cfg = default_cfg()
+    cfg = apply_overrides(default_cfg(), args)
     paths = write_cfgs(cfg)
     return subprocess.call([sys.executable, "-m", "omni.eval", paths["eval"]], cwd=HERE)
 
 
 def cmd_all(args):
     """Producer in the background, then wait for the held-out blocks, then both arms, then eval."""
-    cfg = default_cfg()
+    cfg = apply_overrides(default_cfg(), args)
     paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
     os.makedirs(RUN, exist_ok=True)
     stream_dir = cfg["produce"]["out_dir"]
@@ -295,13 +337,21 @@ def main():
     ap.add_argument("--foreground", action="store_true")
     ap.add_argument("--workers", type=int, default=1,
                     help="producer processes; each reads index i mod N of every stream")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
+                    help="sm=10.44M (debug), md=84.6M (kill test), lg=454M")
+    ap.add_argument("--base-len", type=int, default=0,
+                    help="text/image finest length; audio scales x1.5, video stays 32; "
+                         "0 keeps 64 (504 packed positions). 1024 => ~7.1k positions")
+    ap.add_argument("--holdout-mult", type=int, default=0,
+                    help="multiply the held-out block sizes (4 => 128/96/64/32, SE ~0.028)")
+    ap.add_argument("--batch", type=int, default=0)
     ap.add_argument("--max-ahead", type=int, default=0,
                     help="producer rolling-buffer cap in shards; 0 keeps the default 24, "
                          "which blocks forever when nothing deletes shards (batch runs: 100000)")
     ap.add_argument("--wait-timeout", type=int, default=3600)
     a = ap.parse_args()
     if a.cmd == "cfg":
-        write_cfgs(default_cfg(), a.budget)
+        write_cfgs(apply_overrides(default_cfg(), a), a.budget)
         return 0
     return {"check": cmd_check, "produce": cmd_produce, "train": cmd_train,
             "eval": cmd_eval, "all": cmd_all}[a.cmd](a) or 0

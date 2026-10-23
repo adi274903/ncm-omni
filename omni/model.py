@@ -12,6 +12,7 @@ Conditioning follows the paper in spirit, not in letter: NCM conditions level k 
 reconstruction z_hat(k-1); our codecs are discrete-only, so we condition on the mean embedding
 of the level-(k-1) codes actually fed in. Named deviation, `cond_mode="gt_embed"`.
 """
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import torch
@@ -96,9 +97,27 @@ def kv_ids(lev):                                            # kept for clarity i
     return lev
 
 
+_FLEX_CACHE = OrderedDict()      # LRU: the block mask is ~200 MB at T=7119, so keep few
+_FLEX_CACHE_MAX = 8
+
+
 def trunc_flex(sched: OmniSchedule, B: int, H: int, T: int, device="cuda",
                cross_level=False, mask_mode="block"):
+    """Block mask for the fused kernel, built once per (length, mask) and broadcast.
+
+    Two things matter at kill-test length. The mask depends only on (level, position), never on
+    b or h, so B/H go in as None: create_block_mask then derives block sparsity from one T x T
+    grid instead of a B x H x T x T one, which at T=7119, B=2, H=12 is 9 GiB of floats and OOMs
+    on any consumer card. And it is cached, because rebuilding a 200 MB mask every step costs
+    more than the forward pass at these sizes.
+    """
     assert create_block_mask is not None, "flex_attention unavailable"
+    key = (T, mask_mode, bool(cross_level), str(device),
+           tuple(sorted(sched.base_len.items())), sched.K)
+    hit = _FLEX_CACHE.get(key)
+    if hit is not None:
+        _FLEX_CACHE.move_to_end(key)
+        return hit
     lev, _, _ = level_ids_for(sched, T, device)
 
     def mask_mod(b, h, q_idx, kv_idx):
@@ -112,7 +131,11 @@ def trunc_flex(sched: OmniSchedule, B: int, H: int, T: int, device="cuda",
             allowed = allowed | ((ql >= 0) & (kl >= 0) & (kl < ql))
         return allowed
 
-    return create_block_mask(mask_mod, B=B, H=H, Q_LEN=T, KV_LEN=T, device=device)
+    bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T, KV_LEN=T, device=device)
+    _FLEX_CACHE[key] = bm
+    while len(_FLEX_CACHE) > _FLEX_CACHE_MAX:
+        _FLEX_CACHE.popitem(last=False)
+    return bm
 
 
 class OmniNCM(nn.Module):
