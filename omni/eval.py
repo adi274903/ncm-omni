@@ -31,7 +31,10 @@ def load_model(path, dev="cuda"):
 @torch.no_grad()
 def score_codes(model, sched, batch, level_cutoff=None, temp=0.0):
     """Greedy level-parallel sample; returns per-(m,k) exact-match accuracy."""
-    gen = model.generate(batch, level_cutoff=level_cutoff, temperature=temp)
+    # Dense SDPA: eval is 48 sequences, so a fused kernel buys nothing, and flex's
+    # per-level shapes (l_0 != l_5) blow the Dynamo cache and fall back to eager anyway.
+    gen = model.generate(batch, level_cutoff=level_cutoff, temperature=temp,
+                         use_flex=False)
     K = sched.K if level_cutoff is None else level_cutoff
     acc = {}
     for k in range(K):
@@ -49,7 +52,7 @@ def score_codes(model, sched, batch, level_cutoff=None, temp=0.0):
 def ar_scores(model, sched, batch, token_budgets):
     """Greedy AR sample up to the largest budget; score only the positions that budget covers."""
     budgets = sorted(set(int(b) for b in token_budgets))
-    gen, _ = model.generate_ar(batch, max_len=budgets[-1])
+    gen, _ = model.generate_ar(batch, max_len=budgets[-1], use_flex=False)
     # raster order index of every (modality, level, position) is what "token budget" means
     order = [(k, m, i) for k in range(sched.K) for m in sched.modalities
              for i in range(sched.level_len(m, k))]
@@ -104,6 +107,19 @@ def run(cfg):
             sched, ck = sch, meta
         else:
             assert sch.total_len == sched.total_len, "arms must share the schedule"
+        # Name the arm from the checkpoint's OWN mask_mode, not from which file it sat in. A
+        # pre-shift `block` run parked in run/train_block is the legacy arm, and must never be
+        # reported as "level-parallel".
+        mm = (meta.get("cfg", {}).get("model", {}) or {}).get("mask_mode", "?")
+        if mm == "strict":
+            name = "level-parallel(strict)"
+        elif mm == "ar":
+            name = "autoregressive"
+        elif mm == "block":
+            name = "level-parallel(LEGACY-leaky)"
+        else:
+            name = f"unknown({mm})"
+        print(f"  {p}  mask_mode={mm}  -> {name}")
         loaded[name] = mdl
     assert loaded, ("no checkpoints found - train at least one arm "
                     "(`run_omni.py train --arm strict`)")
@@ -195,21 +211,39 @@ def run(cfg):
     for r in sorted(table, key=lambda r: (r["arm"], r["nfe"])):
         print(f"| {r['arm']} | {r['nfe']} | {r['mean']:.4f} | {r['coarse']:.4f} | {r['finest']:.4f} |")
 
-    # the one-line reading of the table
+    # the one-line reading of the table - and it refuses to name a winner when both arms are
+    # under the constant predictor, because "A beats B" is not a result when A and B both lose
+    # to `always emit the modal code`.
     mine = "level-parallel(strict)" if strict is not None else "level-parallel"
     lp = {r["nfe"]: r["mean"] for r in table if r["arm"] == mine}
     if ar is not None:
         arm = {r["nfe"]: r["mean"] for r in table if r["arm"] == "autoregressive"}
         target = lp.get(sched.K, 0.0)
-        beat = [n for n, v in sorted(arm.items()) if v >= target]
-        msg = (f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
-               f"AR needs NFE={beat[0]} for the same quality" if beat
-               else f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
-                    f"AR never matches it within {max(arm)} tokens")
+        best = max([target] + list(arm.values()))
+        if best <= baseline:
+            msg = (f"VOID: every arm is at or below the constant predictor ({baseline:.4f}) - "
+                   f"best={best:.4f}. No comparison is meaningful yet: check the shifted input "
+                   f"(`tests/test_shifted_input.py`), the step budget, and whether the checkpoints "
+                   f"predate the shift.")
+        else:
+            beat = [n for n, v in sorted(arm.items()) if v >= target]
+            msg = (f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
+                   f"AR needs NFE={beat[0]} for the same quality" if beat
+                   else f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
+                        f"AR never matches it within {max(arm)} tokens")
+            if target <= baseline:
+                msg += f"  (but the parallel arm is still under the baseline {baseline:.4f})"
         print("\n" + msg)
         json.dump({"table": table, "summary": msg}, open(cfg["out"], "w"), indent=2)
     else:
-        json.dump({"table": table}, open(cfg["out"], "w"), indent=2)
+        target = lp.get(sched.K, 0.0)
+        msg = (f"VOID: the parallel arm is at or below the constant predictor "
+               f"({baseline:.4f}) - best={target:.4f}." if target <= baseline
+               else f"level-parallel reaches {target:.4f} at NFE={sched.K} "
+                    f"(baseline {baseline:.4f})")
+        print("\n" + msg)
+        json.dump({"table": table, "baseline": baseline, "summary": msg},
+                  open(cfg["out"], "w"), indent=2)
     print("wrote", cfg["out"])
 
 

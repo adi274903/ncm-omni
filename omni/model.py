@@ -39,6 +39,12 @@ except Exception:                                          # pragma: no cover
     create_block_mask = None
 
 
+try:                                # per-level widths differ (24 vs 56 keys), so flex recompiles
+    torch._dynamo.config.cache_size_limit = 32   # once per level and hits the default limit of 8
+except Exception:                   # -> silent fallback to the unfused eager kernel
+    pass
+
+
 class OmniConfig:
     def __init__(self, sched: OmniSchedule, vocab: Dict[str, int], n_embd=384, n_layer=6,
                  n_head=6, n_kv_head=2, dropout=0.0, qk_norm=True,
