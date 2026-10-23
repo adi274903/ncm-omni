@@ -178,8 +178,8 @@ def run(cfg):
     print(f"constant-predictor baseline from {src} = {baseline:.4f}")
 
     table = []
-    for name, model in (("level-parallel", block), ("level-parallel(strict)", strict)):
-        if model is None:
+    for name, model in loaded.items():               # whatever was actually loaded, labelled
+        if "autoregressive" in name:
             continue
         for kp in range(1, sched.K + 1):
             acc = score_codes(model, sched, batch, level_cutoff=kp)
@@ -214,7 +214,8 @@ def run(cfg):
     # the one-line reading of the table - and it refuses to name a winner when both arms are
     # under the constant predictor, because "A beats B" is not a result when A and B both lose
     # to `always emit the modal code`.
-    mine = "level-parallel(strict)" if strict is not None else "level-parallel"
+    mine = ("level-parallel(strict)" if "level-parallel(strict)" in loaded
+            else next((n for n in loaded if "level-parallel" in n), "level-parallel"))
     lp = {r["nfe"]: r["mean"] for r in table if r["arm"] == mine}
     if ar is not None:
         arm = {r["nfe"]: r["mean"] for r in table if r["arm"] == "autoregressive"}
