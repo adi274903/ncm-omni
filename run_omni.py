@@ -46,6 +46,8 @@ def apply_overrides(cfg, a):
         cfg["train"]["batch"] = int(a.batch)
     if getattr(a, "save_every", None):
         cfg["train"]["save_every"] = int(a.save_every)
+    if getattr(a, "log_every", None):
+        cfg["train"]["log_every"] = int(a.log_every)
     n = getattr(a, "base_len", 0)
     if n:
         r = n / 64.0                       # 64 is the reference text/image length
@@ -375,6 +377,9 @@ def main(argv=None):
                     help="feed the duplex run from the Hub directly instead of shards. Measured "
                          "1.5 samples/s in one process vs 45 for a sharded producer, so this is "
                          "for a short kill test where a corpus is unwanted, not for a real run.")
+    ap.add_argument("--log-every", type=int, default=None, dest="log_every",
+                    help="steps between metric lines. Default 10 = one line every ~100 s on a live "
+                         "stream; pass 1 to get a line every step so silence always means a stall")
     ap.add_argument("--save-every", type=int, default=None, dest="save_every",
                     help="checkpoint interval; the live-stream path has no replay, so this is "
                          "the only way to survive a Colab session limit")
