@@ -75,6 +75,30 @@ def ar_scores(model, sched, batch, token_budgets):
     return out
 
 
+@torch.no_grad()
+def cond_scores(model, sched, batch):
+    """Per-(m,k) accuracy with the TRUE coarser levels given - one forward, no sampling.
+
+    This is the metric that survives level 0 being unpredictable. Free-running generation needs
+    a correct level 0 to condition everything else on, and level 0 is a 1-of-256 guess from
+    nothing (val text_L0 ~ 0.01), so the free-running number is dominated by that first coin
+    flip. Conditional accuracy asks the question the architecture actually answers: given the
+    coarser levels, how much of level k do you reconstruct in ONE pass?
+    """
+    logits = model(batch, use_flex=False)
+    acc = {}
+    for k in range(sched.K):
+        for m in sched.modalities:
+            l, off = sched.level_len(m, k), sched.offsets(m)[k]
+            gt = batch["codes"][m][:, off:off + l]
+            keep = (gt != sched.null_code) & batch["present"][m].unsqueeze(1)
+            if not keep.any():
+                continue
+            pred = logits[(m, k)].argmax(-1)
+            acc[(m, k)] = float((pred == gt)[keep].float().mean())
+    return acc
+
+
 def summarise(acc, sched, n_levels):
     """Mean accuracy over generated levels + the coarsest and the finest generated level."""
     if not acc:
@@ -137,8 +161,22 @@ def run(cfg):
     for f in files:
         ds_f = EvalSet(f)
         rows += [ds_f[i] for i in range(len(ds_f))]
-    if cfg.get("n_samples"):
-        rows = rows[:cfg["n_samples"]]
+    if cfg.get("n_samples") and cfg["n_samples"] < len(rows):
+        # Round-robin over modalities. A plain `rows[:n]` silently deleted the video group,
+        # because the files are read audio, image, text, video and video came last - so "video"
+        # columns read as "-" and the smallest modality vanished from every table.
+        by = {}
+        for r in rows:                             # rows are {"codes", "present"}; key on modality
+            m = next((x for x in sched.modalities if r["present"].get(x)), "?")
+            by.setdefault(m, []).append(r)
+        order = list(by)
+        keep, i = [], 0
+        while len(keep) < cfg["n_samples"] and any(by[m] for m in order):
+            m = order[i % len(order)]
+            if by[m]:
+                keep.append(by[m].pop(0))
+            i += 1
+        rows = keep
     batch = to_device(collate(rows, sched), dev)
     print(f"eval on {len(rows)} held-out samples from {len(files)} group file(s) | "
           f"packed positions {sched.total_len}")
@@ -173,8 +211,13 @@ def run(cfg):
             for k in range(sched.K):
                 off, l = sched.offsets(m)[k], sched.level_len(m, k)
                 counts[(m, k)].update(batch["codes"][m][:, off:off + l].reshape(-1).tolist())
-    vals = [c.most_common(1)[0][1] / max(sum(c.values()), 1) for c in counts.values() if c]
-    baseline = sum(vals) / max(len(vals), 1)
+    freq = {key: c.most_common(1)[0][1] / max(sum(c.values()), 1)
+            for key, c in counts.items() if c}
+    baseline = sum(freq.values()) / max(len(freq), 1)
+    # per level, so the conditional table is compared against the right floor at each level
+    base_lv = {k: (sum(v for (m, kk), v in freq.items() if kk == k)
+                   / max(1, sum(1 for (m, kk) in freq if kk == k)))
+               for k in range(sched.K)}
     print(f"constant-predictor baseline from {src} = {baseline:.4f}")
 
     table = []
@@ -205,46 +248,63 @@ def run(cfg):
         print("no AR checkpoint: the comparison table will be one-sided "
               "(train one with model.mask_mode='ar' on the same shards)")
 
-    print(f"\nconstant predictor = {baseline:.4f}\n")
+    cond = {}
+    for name, model in loaded.items():
+        cond[name] = cond_scores(model, sched, batch)
+    print("\n### conditional: true coarser levels given, one forward per level (no sampling)\n")
+    print("| arm | level | text | image | audio | video | mean | constant |")
+    print("|---|---|---|---|---|---|---|---|")
+    for name, acc in cond.items():
+        for k in range(sched.K):
+            cells = [acc.get((m, k)) for m in sched.modalities]
+            got = [c for c in cells if c is not None]
+            row = " | ".join("  -  " if c is None else f"{c:.3f}" for c in cells)
+            print(f"| {name} | L{k} | {row} | {sum(got)/max(1,len(got)):.4f} | "
+                  f"{base_lv[k]:.3f} |")
+    print()
+    print("### free-running: sample from level 0, no teacher (the unconditional number)\n")
     print("| arm | NFE | mean acc | coarse | finest |")
     print("|---|---|---|---|---|")
     for r in sorted(table, key=lambda r: (r["arm"], r["nfe"])):
         print(f"| {r['arm']} | {r['nfe']} | {r['mean']:.4f} | {r['coarse']:.4f} | {r['finest']:.4f} |")
 
-    # the one-line reading of the table - and it refuses to name a winner when both arms are
-    # under the constant predictor, because "A beats B" is not a result when A and B both lose
-    # to `always emit the modal code`.
+    # ---------------------------------------------------------------- verdict
+    # Two numbers, and they answer different questions:
+    #   conditional  given the true coarser levels, how much of level k comes back in ONE pass
+    #   free-running sample from level 0 - the number a paper would quote, and the one that dies
+    #                here because level 0 is a 1-of-256 guess from nothing (val text_L0 ~ 0.01),
+    #                so every later level is conditioned on a wrong prefix
     mine = ("level-parallel(strict)" if "level-parallel(strict)" in loaded
             else next((n for n in loaded if "level-parallel" in n), "level-parallel"))
-    lp = {r["nfe"]: r["mean"] for r in table if r["arm"] == mine}
-    if ar is not None:
-        arm = {r["nfe"]: r["mean"] for r in table if r["arm"] == "autoregressive"}
-        target = lp.get(sched.K, 0.0)
-        best = max([target] + list(arm.values()))
-        if best <= baseline:
-            msg = (f"VOID: every arm is at or below the constant predictor ({baseline:.4f}) - "
-                   f"best={best:.4f}. No comparison is meaningful yet: check the shifted input "
-                   f"(`tests/test_shifted_input.py`), the step budget, and whether the checkpoints "
-                   f"predate the shift.")
-        else:
-            beat = [n for n, v in sorted(arm.items()) if v >= target]
-            msg = (f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
-                   f"AR needs NFE={beat[0]} for the same quality" if beat
-                   else f"level-parallel reaches {target:.4f} at NFE={sched.K}; "
-                        f"AR never matches it within {max(arm)} tokens")
-            if target <= baseline:
-                msg += f"  (but the parallel arm is still under the baseline {baseline:.4f})"
-        print("\n" + msg)
-        json.dump({"table": table, "summary": msg}, open(cfg["out"], "w"), indent=2)
-    else:
-        target = lp.get(sched.K, 0.0)
-        msg = (f"VOID: the parallel arm is at or below the constant predictor "
-               f"({baseline:.4f}) - best={target:.4f}." if target <= baseline
-               else f"level-parallel reaches {target:.4f} at NFE={sched.K} "
-                    f"(baseline {baseline:.4f})")
-        print("\n" + msg)
-        json.dump({"table": table, "baseline": baseline, "summary": msg},
-                  open(cfg["out"], "w"), indent=2)
+    fine = sched.K - 1
+    my_cond = sum(cond[mine].get((m, fine), 0.0) for m in sched.modalities
+                  if (m, fine) in cond[mine])
+    my_cond /= max(1, sum(1 for m in sched.modalities if (m, fine) in cond[mine]))
+    ar_cond = None
+    if "autoregressive" in cond:
+        ar_cond = sum(cond["autoregressive"].get((m, fine), 0.0) for m in sched.modalities
+                      if (m, fine) in cond["autoregressive"])
+        ar_cond /= max(1, sum(1 for m in sched.modalities if (m, fine) in cond["autoregressive"]))
+
+    free_best = max([0.0] + [r["mean"] for r in table])
+    lines = [f"conditional L{fine} ({'one forward' if True else ''}): {mine} {my_cond:.4f}"
+             + (f" vs AR {ar_cond:.4f} ({sched.K} forwards vs {sum(sched.flat_len(m) for m in sched.modalities)})"
+                if ar_cond is not None else "")
+             + f" | constant {base_lv[fine]:.4f}"]
+    if my_cond <= base_lv[fine]:
+        lines.append(f"VOID: the conditional finest level is at or below the constant predictor "
+                     f"({base_lv[fine]:.4f}) - the model has not learned to use the coarser levels.")
+    lines.append(f"free-running best = {free_best:.4f} (constant {baseline:.4f})"
+                 + ("" if free_best > baseline else
+                    " - VOID, and expected: level 0 is unpredictable, so this number measures "
+                    "the propagation of the first wrong guess, not the architecture."))
+    msg = "\n".join(lines)
+    print("\n" + msg)
+    json.dump({"table": table, "conditional": {k: {f"{m}_L{kk}": v
+                                                   for (m, kk), v in acc.items()}
+                                               for k, acc in cond.items()},
+               "baseline": baseline, "baseline_by_level": base_lv, "summary": msg},
+              open(cfg["out"], "w"), indent=2)
     print("wrote", cfg["out"])
 
 
