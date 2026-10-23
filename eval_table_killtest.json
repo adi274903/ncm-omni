@@ -1,0 +1,158 @@
+{
+  "table": [
+    {
+      "n_feval": 4,
+      "mean": 0.0833333358168602,
+      "coarse": 0.0833333358168602,
+      "finest": 0.0833333358168602,
+      "arm": "level-parallel(strict)",
+      "nfe": 1,
+      "levels": 1
+    },
+    {
+      "n_feval": 8,
+      "mean": 0.08463541918899864,
+      "coarse": 0.0833333358168602,
+      "finest": 0.08593750256113708,
+      "arm": "level-parallel(strict)",
+      "nfe": 2,
+      "levels": 2
+    },
+    {
+      "n_feval": 12,
+      "mean": 0.08463541918899864,
+      "coarse": 0.0833333358168602,
+      "finest": 0.08463541918899864,
+      "arm": "level-parallel(strict)",
+      "nfe": 3,
+      "levels": 3
+    },
+    {
+      "n_feval": 16,
+      "mean": 0.08528646087506786,
+      "coarse": 0.0833333358168602,
+      "finest": 0.08723958593327552,
+      "arm": "level-parallel(strict)",
+      "nfe": 4,
+      "levels": 4
+    },
+    {
+      "n_feval": 20,
+      "mean": 0.08736979425884783,
+      "coarse": 0.0833333358168602,
+      "finest": 0.09570312779396772,
+      "arm": "level-parallel(strict)",
+      "nfe": 5,
+      "levels": 5
+    },
+    {
+      "n_feval": 24,
+      "mean": 0.09307183461108555,
+      "coarse": 0.0833333358168602,
+      "finest": 0.12158203637227416,
+      "arm": "level-parallel(strict)",
+      "nfe": 6,
+      "levels": 6
+    },
+    {
+      "n_feval": 9,
+      "mean": 0.07638889116545518,
+      "coarse": 0.0833333358168602,
+      "finest": 0.0,
+      "arm": "autoregressive",
+      "nfe": 31,
+      "levels": null
+    },
+    {
+      "n_feval": 13,
+      "mean": 0.07852564336588749,
+      "coarse": 0.0833333358168602,
+      "finest": 0.0,
+      "arm": "autoregressive",
+      "nfe": 63,
+      "levels": null
+    },
+    {
+      "n_feval": 17,
+      "mean": 0.08057598276611637,
+      "coarse": 0.0833333358168602,
+      "finest": 0.0,
+      "arm": "autoregressive",
+      "nfe": 126,
+      "levels": null
+    },
+    {
+      "n_feval": 21,
+      "mean": 0.08271329610475472,
+      "coarse": 0.0833333358168602,
+      "finest": 0.03125,
+      "arm": "autoregressive",
+      "nfe": 252,
+      "levels": null
+    }
+  ],
+  "conditional": {
+    "level-parallel(strict)": {
+      "text_L0": 0.0,
+      "image_L0": 0.3333333432674408,
+      "audio_L0": 0.0,
+      "video_L0": 0.0,
+      "text_L1": 0.0,
+      "image_L1": 0.5416666865348816,
+      "audio_L1": 0.0,
+      "video_L1": 0.0,
+      "text_L2": 0.010416666977107525,
+      "image_L2": 0.609375,
+      "audio_L2": 0.0,
+      "video_L2": 0.0,
+      "text_L3": 0.0364583358168602,
+      "image_L3": 0.5755208730697632,
+      "audio_L3": 0.0,
+      "video_L3": 0.0,
+      "text_L4": 0.1497395932674408,
+      "image_L4": 0.5611979365348816,
+      "audio_L4": 0.0013020833721384406,
+      "video_L4": 0.0078125,
+      "text_L5": 0.4765625,
+      "image_L5": 0.5631510615348816,
+      "audio_L5": 0.001953125,
+      "video_L5": 0.0078125
+    },
+    "autoregressive": {
+      "text_L0": 0.0,
+      "image_L0": 0.4166666865348816,
+      "audio_L0": 0.0,
+      "video_L0": 0.0,
+      "text_L1": 0.0,
+      "image_L1": 0.40625,
+      "audio_L1": 0.0,
+      "video_L1": 0.0,
+      "text_L2": 0.010416666977107525,
+      "image_L2": 0.4270833432674408,
+      "audio_L2": 0.0,
+      "video_L2": 0.03125,
+      "text_L3": 0.015625,
+      "image_L3": 0.3958333432674408,
+      "audio_L3": 0.0052083334885537624,
+      "video_L3": 0.0,
+      "text_L4": 0.0442708358168602,
+      "image_L4": 0.3802083432674408,
+      "audio_L4": 0.0,
+      "video_L4": 0.0390625,
+      "text_L5": 0.2141927182674408,
+      "image_L5": 0.3619791865348816,
+      "audio_L5": 0.001953125,
+      "video_L5": 0.0
+    }
+  },
+  "baseline": 0.17439048310630342,
+  "baseline_by_level": {
+    "0": 0.16626602564102563,
+    "1": 0.19419070512820513,
+    "2": 0.16499399038461537,
+    "3": 0.1600861378205128,
+    "4": 0.16559995993589743,
+    "5": 0.1952060797275641
+  },
+  "summary": "conditional L5 (one forward): level-parallel(strict) 0.2624 vs AR 0.1445 (6 forwards vs 504) | constant 0.1952\nfree-running best = 0.0931 (constant 0.1744) - VOID, and expected: level 0 is unpredictable, so this number measures the propagation of the first wrong guess, not the architecture."
+}
