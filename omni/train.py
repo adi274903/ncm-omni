@@ -167,13 +167,122 @@ def run(cfg, smoke=None):
     print("saved", os.path.join(out_dir, "final.pt"))
 
 
+def run_duplex(cfg, smoke=None):
+    """Both arms, one stream, one pass. The batch is built once and stepped by every arm, so the
+    A/B cannot drift: same rows, same order, same packing. Costs one model's memory per arm and
+    replaces produce-then-train-two-times."""
+    import copy
+
+    from omni.livestream import iter_rows
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    out_dir = cfg["out_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    arms = cfg.get("arms") or ["strict", "ar"]
+    steps = smoke or cfg["steps"]
+    bs = cfg.get("batch", 4)
+    use_bf16 = dev == "cuda"
+
+    models, opts, sched = {}, {}, None
+    for arm in arms:
+        c = copy.deepcopy(cfg)
+        c["model"]["mask_mode"] = arm
+        m, s = build(c)
+        m.to(dev).train()
+        models[arm] = m
+        opts[arm] = torch.optim.AdamW(m.parameters(), lr=cfg.get("lr", 3e-4),
+                                      betas=(0.9, 0.95), weight_decay=cfg.get("wd", 0.01))
+        sched = sched or s
+        print(f"{arm:6s} params {n_params(m)/1e6:.2f}M")
+    T = sched.total_len
+    print(f"packed positions/sample {T} | arms {arms} | single pass over the live stream")
+
+    evals = {}
+    for group, path in (cfg.get("eval_files") or {}).items():
+        if os.path.exists(path):
+            evals[group] = EvalSet(path)
+    print("eval sets:", {g: len(d) for g, d in evals.items()} or "none yet")
+
+    live_cfg = cfg.get("live_cfg")
+    from omni.livestream import iter_rows
+    if live_cfg:
+        rows = iter_rows(live_cfg, holdout=live_cfg.get("holdout"),
+                         eval_dir=live_cfg.get("out_dir"))
+        print("data: live Hub stream (one pass, ~1.5 samples/s measured - a kill test only)")
+    else:
+        rows = iter(ShardStream(cfg["shard_dir"], consume=cfg.get("consume", False),
+                                start_sample=cfg.get("start_sample", 0),
+                                producer_log=cfg.get("producer_log"),
+                                timeout_s=cfg.get("stream_timeout", 600)))
+        print(f"data: shards in {cfg['shard_dir']} (both arms read the same shards)")
+    metrics = {a: open(os.path.join(out_dir, f"metrics_{a}.jsonl"), "a") for a in arms}
+    it = iter(rows)
+    t0, toks = time.time(), 0
+    for step in range(steps):
+        batch_rows = []
+        while len(batch_rows) < bs:
+            try:
+                batch_rows.append(next(it))
+            except StopIteration:
+                print("stream ended: stopping")
+                steps = step
+                break
+        if len(batch_rows) < bs:
+            break
+        batch = to_device(collate(batch_rows, sched), dev)
+        rec = {"step": step}
+        for arm in arms:
+            for g in opts[arm].param_groups:
+                g["lr"] = lr_at(step, {**cfg, "steps": steps})
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                logits = models[arm](batch)
+                loss = omni_loss(logits, batch, sched,
+                                 label_smoothing=cfg.get("label_smoothing", 0.0))
+            opts[arm].zero_grad(set_to_none=True)
+            loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(models[arm].parameters(), cfg.get("clip", 1.0))
+            opts[arm].step()
+            rec[arm] = round(float(loss.detach()), 5)
+            rec[f"{arm}_gn"] = round(float(gn.detach()), 3)
+        toks += bs * T
+        rec["pos_per_s"] = round(toks / (time.time() - t0), 1)
+        if step % max(1, cfg.get("log_every", 10)) == 0 or step == steps - 1:
+            print(json.dumps(rec), flush=True)
+            for arm in arms:
+                metrics[arm].write(json.dumps(rec) + "\n")
+                metrics[arm].flush()
+        if cfg.get("save_every") and (step + 1) % cfg["save_every"] == 0:
+            for arm in arms:
+                d = os.path.join(out_dir, f"train_{arm}")
+                os.makedirs(d, exist_ok=True)
+                torch.save({"model": models[arm].state_dict(), "cfg": cfg, "step": step},
+                           os.path.join(d, f"step{step+1}.pt"))
+
+    dt = time.time() - t0
+    for arm in arms:
+        d = os.path.join(out_dir, f"train_{arm}")
+        os.makedirs(d, exist_ok=True)
+        torch.save({"model": models[arm].state_dict(), "cfg": cfg, "step": steps - 1},
+                   os.path.join(d, "final.pt"))
+        print("saved", os.path.join(d, "final.pt"))
+    print(f"DUPLEX {steps} steps | {dt/max(1, steps):.2f} s/step for {len(arms)} arms "
+          f"| {toks/dt:.0f} pos/s | {steps*bs:,} samples seen once")
+    if smoke:
+        return
+    have = sorted(f for f in os.listdir(live_cfg["out_dir"]) if f.startswith("eval_"))
+    print("eval blocks:", have or "NONE")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cfg")
     ap.add_argument("--smoke", type=int, default=0)
     a = ap.parse_args()
     cfg = json.load(open(a.cfg))
-    run(cfg, smoke=a.smoke or None)
+    if cfg.get("arms"):
+        run_duplex(cfg, smoke=a.smoke or None)
+    else:
+        run(cfg, smoke=a.smoke or None)
 
 
 if __name__ == "__main__":

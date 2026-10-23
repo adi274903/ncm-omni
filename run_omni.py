@@ -44,6 +44,8 @@ def apply_overrides(cfg, a):
         cfg["train"].update(batch=p["batch"], lr=p["lr"], warmup=p["warmup"])
     if getattr(a, "batch", 0):
         cfg["train"]["batch"] = int(a.batch)
+    if getattr(a, "save_every", None):
+        cfg["train"]["save_every"] = int(a.save_every)
     n = getattr(a, "base_len", 0)
     if n:
         r = n / 64.0                       # 64 is the reference text/image length
@@ -280,6 +282,29 @@ def cmd_train(args):
     cfg = apply_overrides(default_cfg(), args)
     paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
     which = paths.get(f"train_{args.arm}") or paths["train_block"]
+    if getattr(args, "arms", None):
+        arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+        bad = [a for a in arms if a not in ("strict", "ar", "block")]
+        if bad:
+            raise SystemExit(f"unknown arms {bad}; pick from strict, ar, block")
+        tcfg = json.load(open(which))
+        live = dict(cfg["produce"])
+        live["sched"], live["vocab"] = cfg["sched"], cfg["vocab"]
+        live["holdout"] = cfg["produce"]["holdout"]
+        # One doc per draw. `batch_docs=8` makes `Source.batch` block until it has 8 decodable
+        # rows, and a slow modality (video downloads, audio decode) then stalls the whole stream
+        # for minutes while every other source sits idle. Weights already control the mix.
+        # With the threaded pump a slow source can no longer block the others, so pull in chunks:
+        # one network round trip per 8 rows instead of per row.
+        live["batch_docs"] = 8
+        tcfg["arms"] = arms
+        if getattr(args, "live", False):
+            tcfg["live_cfg"] = live
+        tcfg["out_dir"] = RUN              # duplex saves into run/train_{arm}/
+        os.makedirs(os.path.join(RUN, "cfg"), exist_ok=True)
+        which = os.path.join(RUN, "cfg", "train_duplex.json")
+        json.dump(tcfg, open(which, "w"), indent=1)
+        print(f"duplex: arms {arms} | live stream, no shards | out {RUN}")
     cmd = [sys.executable, "-m", "omni.train", which]
     if args.smoke:
         cmd += ["--smoke", str(args.smoke)]
@@ -334,6 +359,16 @@ def main():
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--smoke", type=int, default=0)
     ap.add_argument("--arm", choices=["block", "ar", "strict"], default="block")
+    ap.add_argument("--live", action="store_true",
+                    help="feed the duplex run from the Hub directly instead of shards. Measured "
+                         "1.5 samples/s in one process vs 45 for a sharded producer, so this is "
+                         "for a short kill test where a corpus is unwanted, not for a real run.")
+    ap.add_argument("--save-every", type=int, default=None, dest="save_every",
+                    help="checkpoint interval; the live-stream path has no replay, so this is "
+                         "the only way to survive a Colab session limit")
+    ap.add_argument("--arms", default=None,
+                    help="comma list to train in one process off the live stream, e.g. strict,ar. "
+                         "No shard corpus is produced or read: both arms step the same batch.")
     ap.add_argument("--foreground", action="store_true")
     ap.add_argument("--workers", type=int, default=1,
                     help="producer processes; each reads index i mod N of every stream")
