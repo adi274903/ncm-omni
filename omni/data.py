@@ -56,11 +56,15 @@ class ShardStream(IterableDataset):
             return "".join(f.readlines()[-n:])
 
     def __iter__(self):
-        seen, t0 = 0, time.time()
+        seen, t0, i = 0, time.time(), 0
         while True:
             files = self._shards()
             if files:
-                path = files[0]                          # always the oldest: deletions keep it consistent
+                # consume=True: the list shrinks as we delete, so index 0 is always next.
+                # consume=False: nothing is deleted, so walking index 0 forever re-reads the
+                # same shard - which is a silent single-shard corpus, not a data bug you can see
+                # in the loss. Walk the sorted list and wrap for the next epoch.
+                path = files[0] if self.consume else files[i % len(files)]
                 try:
                     z, meta = read_npz(path)
                 except Exception:                        # half-written from the producer
@@ -77,6 +81,8 @@ class ShardStream(IterableDataset):
                         os.remove(path)
                     except OSError:
                         pass
+                else:
+                    i += 1
                 continue
             if os.path.exists(os.path.join(self.dir, "DONE")):
                 return                                   # producer finished and nothing is left
