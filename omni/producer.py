@@ -271,10 +271,30 @@ GROUPS["video_ucf"] = "video"
 class Source:
     """One stream with retry and a reopen that fast-forwards past what was already read."""
 
-    def __init__(self, name, loader, fmt):
+    def __init__(self, name, loader, fmt, shard=(0, 1)):
         self.name, self.loader, self.fmt = name, loader, fmt
         self.n, self.fails, self.dead, self.bad = 0, 0, False, 0
-        self.it = iter(loader())
+        self.shard, self.sharded = shard, False
+        self.it = self._open()
+
+    def _open(self):
+        """Split the stream at the *source* level, not after downloading it.
+
+        `ds.shard(N, i)` makes the backend read only its share of the parquet files. Filtering on
+        `index % N` instead - which is what the first version did - still downloads every row in
+        every worker, so N workers cost N times the bandwidth and run N times slower. The fallback
+        filter stays for backends that refuse to shard, but it must not be applied on top of a real
+        shard or each worker would see 1/N^2 of the data.
+        """
+        ds = self.loader()
+        if self.shard[1] > 1:
+            try:
+                ds = ds.shard(num_shards=self.shard[1], index=self.shard[0], contiguous=False)
+                self.sharded = True
+            except Exception as e:                             # noqa: BLE001
+                log(f"[source] {self.name}: backend shard unavailable "
+                    f"({type(e).__name__}: {str(e)[:60]}) - index fallback, full stream per worker")
+        return iter(ds)
 
     def reopen(self, err):
         while self.fails < 5:
@@ -282,7 +302,7 @@ class Source:
             log(f"[source] {self.name}: {type(err).__name__}: {str(err)[:90]} -> reopen {self.fails}/5")
             time.sleep(min(30, 4 * self.fails))
             try:
-                it = iter(self.loader())
+                it = self._open()
                 for _ in range(self.n):                        # fast-forward, no encoding
                     next(it)
                 self.it = it
@@ -304,7 +324,9 @@ class Source:
                     self.dead = True
                     break
                 continue
-            self.n += 1
+            self.n += 1                                       # raw index: what reopen() replays
+            if not self.sharded and self.shard[1] > 1 and (self.n - 1) % self.shard[1] != self.shard[0]:
+                continue
             try:
                 d = self.fmt(ex)
             except Exception:                                  # noqa: BLE001
@@ -430,7 +452,11 @@ def run(cfg, selfcheck=False):
     budget = cfg["sample_budget"]
     shard_n = cfg["shard_samples"]
     max_ahead = cfg["max_ahead_shards"]
-    holdout = cfg["holdout"]
+    worker, nworkers = cfg.get("worker", (0, 1))
+    assert 0 <= worker < nworkers, f"worker {worker} of {nworkers}"
+    # Only worker 0 writes the held-out blocks. Every worker reads a disjoint slice, so the rows it
+    # holds out are invisible to the others - one copy of each eval file, no duplicates.
+    holdout = {g: (n if worker == 0 else 0) for g, n in cfg["holdout"].items()}
     skip = cfg.get("skip_samples", 0)
     mix = {k: float(v) for k, v in cfg["mix"].items() if k in SOURCES}
     only = cfg.get("only_sources")
@@ -438,15 +464,26 @@ def run(cfg, selfcheck=False):
         mix = {k: v for k, v in mix.items() if k in only}
     assert mix, "no usable sources in the mix"
 
-    live = {}
+    live, skipped = {}, {}
     for name in mix:
-        try:
-            live[name] = Source(name, SOURCES[name][0], SOURCES[name][1])
-        except Exception as e:                                 # noqa: BLE001
-            log(f"[source] {name} skipped: {type(e).__name__}: {str(e)[:100]}")
+        for attempt in range(4):
+            try:
+                live[name] = Source(name, SOURCES[name][0], SOURCES[name][1],
+                                    shard=(worker, nworkers))
+                break
+            except Exception as e:                             # noqa: BLE001
+                err = f"{type(e).__name__}: {str(e)[:90]}"
+                if attempt == 3:
+                    skipped[name] = err
+                    log(f"[source] {name} SKIPPED after 4 attempts: {err}")
+                else:
+                    time.sleep(3 * (attempt + 1))              # 429 from a burst of stream opens
     if not live:
         log("FATAL: no source could be opened")
         return 2
+    if skipped:
+        log(f"WARNING: {len(skipped)} source(s) missing - the mix is NOT the configured one:",
+            list(skipped))
     tot = sum(mix[n] for n in live)
     frac = {n: mix[n] / tot for n in live}
     log("sources:", {n: round(frac[n], 3) for n in live})
@@ -462,7 +499,8 @@ def run(cfg, selfcheck=False):
 
     def next_shard_path():
         nonlocal shard_idx
-        p = os.path.join(out, f"shard_{shard_idx:06d}.npz")
+        tag = f"_w{worker}" if nworkers > 1 else ""
+        p = os.path.join(out, f"shard{tag}_{shard_idx:06d}.npz")
         shard_idx += 1
         return p
 
@@ -474,8 +512,9 @@ def run(cfg, selfcheck=False):
                 break
             arr = stack_samples(rows, sched)
             if seen_so_far[0] > skip:                          # never rewrite what a resume already trained on
+                mine = f"shard_w{worker}_" if nworkers > 1 else "shard_"
                 while (sum(1 for f in os.listdir(out)
-                           if f.startswith("shard_") and f.endswith(".npz")) >= max_ahead):
+                           if f.startswith(mine) and f.endswith(".npz")) >= max_ahead):
                     if os.path.exists(os.path.join(out, "STOP")):
                         log("STOP seen, exiting")
                         sys.exit(0)
@@ -494,7 +533,8 @@ def run(cfg, selfcheck=False):
                            stack_samples(held[group], sched), meta)
                 log(f"[eval] {group}: {holdout[group]} held out")
                 if all(len(held.get(g, [])) >= holdout.get(g, 0) for g in needed):
-                    open(os.path.join(out, "EVAL_READY"), "w").write("1")
+                    if nworkers == 1:
+                        open(os.path.join(out, "EVAL_READY"), "w").write("1")
             return
         seen_so_far[0] += 1
         if len(shuf) < cfg["shuffle_buf"]:
@@ -527,10 +567,14 @@ def run(cfg, selfcheck=False):
                    "per_source": used, "eval_held": {g: len(v) for g, v in held.items()},
                    "elapsed_min": round((time.time() - t0) / 60, 2),
                    "samples_per_s": round(seen_so_far[0] / max(1e-9, time.time() - t0), 1)},
-                  open(os.path.join(out, "progress.json"), "w"))
-        if seen_so_far[0] % 100 == 0:
+                  open(os.path.join(out, "progress.json" if nworkers == 1
+                                    else f"progress_w{worker}.json"), "w"))
+        if seen_so_far[0] % 25 == 0:
+            raw = {n: live[n].n for n in live}
             log(f"progress {seen_so_far[0]}/{budget} samples | {written} shards | "
-                f"{seen_so_far[0] / max(1e-9, time.time() - t0):.1f} samples/s")
+                f"{seen_so_far[0] / max(1e-9, time.time() - t0):.2f} samples/s | "
+                f"pulled {sum(raw.values())} rows | sharded="
+                f"{sum(1 for n in live if live[n].sharded)}/{len(live)}")
 
     for row in shuf:                                           # flush the shuffle buffer
         cur.append(row)
@@ -538,12 +582,16 @@ def run(cfg, selfcheck=False):
     for g, rows in held.items():                               # under-filled groups still get a file
         if rows and len(rows) < holdout.get(g, 0):
             atomic_npz(os.path.join(out, f"eval_{g}.npz"), stack_samples(rows, sched), meta)
-    open(os.path.join(out, "EVAL_READY"), "w").write("1")
     stats = dict(samples=seen_so_far[0], shards=written, per_source=used, dropped=dropped,
-                 budget=budget, skip_samples=skip, schedule=meta,
+                 budget=budget, skip_samples=skip, schedule=meta, worker=[worker, nworkers],
+                 skipped_sources=skipped,
                  elapsed_min=round((time.time() - t0) / 60, 2))
-    json.dump(stats, open(os.path.join(out, "stats.json"), "w"), indent=2)
-    open(os.path.join(out, "DONE"), "w").write("1")
+    if nworkers == 1:                                          # single process: owns the sentinels
+        open(os.path.join(out, "EVAL_READY"), "w").write("1")
+        json.dump(stats, open(os.path.join(out, "stats.json"), "w"), indent=2)
+        open(os.path.join(out, "DONE"), "w").write("1")
+    else:                                                       # coordinator aggregates and decides
+        json.dump(stats, open(os.path.join(out, f"stats_w{worker}.json"), "w"), indent=2)
     log("DONE", {k: stats[k] for k in ("samples", "shards", "elapsed_min")})
     return 0
 
@@ -552,8 +600,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cfg")
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--worker", default=None, help="i/N - this process's slice of every stream")
     a = ap.parse_args()
     cfg = json.load(open(a.cfg))
+    if a.worker:
+        i, n = a.worker.split("/")
+        cfg["worker"] = (int(i), int(n))
     try:
         return run(cfg, selfcheck=a.selfcheck)
     except SystemExit:

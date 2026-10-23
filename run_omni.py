@@ -137,18 +137,95 @@ def _write_tmp(obj):
     return path
 
 
+def _nshards(d):
+    try:
+        return sum(1 for f in os.listdir(d) if f.startswith("shard_") and f.endswith(".npz"))
+    except FileNotFoundError:
+        return 0
+
+
 def cmd_produce(args):
     cfg = default_cfg()
     paths = write_cfgs(cfg, budget=args.budget)
     os.makedirs(RUN, exist_ok=True)
-    log = open(os.path.join(RUN, "producer.log"), "w")
-    p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
-                         cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
-    print("producer pid", p.pid, "-> ", os.path.join(RUN, "producer.log"))
-    if args.foreground:
-        p.wait()
-        return p.returncode
-    print("background; training can start once EVAL_READY exists")
+    nworkers = max(1, args.workers)
+    if nworkers == 1:
+        log = open(os.path.join(RUN, "producer.log"), "w")
+        p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
+                             cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+        print("producer pid", p.pid, "-> ", os.path.join(RUN, "producer.log"))
+        if args.foreground:
+            p.wait()
+            return p.returncode
+        print("background; training can start once EVAL_READY exists")
+        return 0
+
+    # ---- parallel: N processes, each reading a disjoint slice (index % N) of every stream.
+    # The held-out blocks come from worker 0 only, and this process owns EVAL_READY/DONE, so a
+    # half-finished fan-out can never look ready.
+    base = json.load(open(paths["produce"]))
+    stream_dir = base["out_dir"]                 # cfg from default_cfg() has no out_dir
+    extra = sum(base["holdout"].values())        # worker 0's budget is spent on the eval blocks
+    for f in ("EVAL_READY", "DONE", "STOP"):
+        fp = os.path.join(stream_dir, f)
+        if os.path.exists(fp):
+            os.remove(fp)
+    total = int(base["sample_budget"])
+    per = total // nworkers
+    procs, logs = [], []
+    for i in range(nworkers):
+        c = json.loads(json.dumps(base))
+        c["sample_budget"] = per + (total - per * nworkers if i == 0 else 0) + (extra if i == 0 else 0)
+        c["worker"] = [i, nworkers]
+        cp = os.path.join(RUN, "cfg", f"produce_w{i}.json")
+        json.dump(c, open(cp, "w"), indent=2)
+        f = open(os.path.join(RUN, f"producer_w{i}.log"), "w")
+        logs.append(f)
+        if i:
+            time.sleep(2.5)                  # spread the initial burst of stream opens
+        procs.append(subprocess.Popen(
+            [sys.executable, "-m", "omni.producer", cp, "--worker", f"{i}/{nworkers}"],
+            cwd=HERE, stdout=f, stderr=subprocess.STDOUT))
+    print(f"{nworkers} producers | budget {total} -> {per}/worker | logs run/producer_w*.log")
+    if not args.foreground:
+        print("background; training can start once EVAL_READY exists")
+        return 0
+
+    t0, codes = time.time(), []
+    try:
+        while any(p.poll() is None for p in procs):
+            time.sleep(10)
+            done = _nshards(stream_dir)
+            print(f"  {done} shards on disk | {time.time() - t0:.0f}s", flush=True)
+    except KeyboardInterrupt:
+        for p in procs:
+            p.terminate()
+        raise
+    codes = [p.wait() for p in procs]
+    for f in logs:
+        f.close()
+    if any(codes):
+        print("producer failure codes:", codes)
+        return 1
+
+    stats = []
+    for i in range(nworkers):
+        sp = os.path.join(stream_dir, f"stats_w{i}.json")
+        if os.path.exists(sp):
+            stats.append(json.load(open(sp)))
+    samples = sum(s.get("samples", 0) for s in stats)
+    shards = _nshards(stream_dir)
+    mins = (time.time() - t0) / 60
+    open(os.path.join(stream_dir, "EVAL_READY"), "w").write("1")
+    out = dict(samples=samples, shards=shards, workers=nworkers,
+               elapsed_min=round(mins, 2), samples_per_s=round(samples / max(mins * 60, 1e-9), 2),
+               per_worker=[s.get("samples", 0) for s in stats],
+               per_source={k: sum(s.get("per_source", {}).get(k, 0) for s in stats)
+                           for k in (stats[0].get("per_source", {}) if stats else {})})
+    json.dump(out, open(os.path.join(stream_dir, "stats.json"), "w"), indent=2)
+    open(os.path.join(stream_dir, "DONE"), "w").write("1")
+    print("DONE", {k: out[k] for k in ("samples", "shards", "workers", "elapsed_min",
+                                       "samples_per_s")})
     return 0
 
 
@@ -211,6 +288,8 @@ def main():
     ap.add_argument("--smoke", type=int, default=0)
     ap.add_argument("--arm", choices=["block", "ar", "strict"], default="block")
     ap.add_argument("--foreground", action="store_true")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="producer processes; each reads index i mod N of every stream")
     ap.add_argument("--wait-timeout", type=int, default=3600)
     a = ap.parse_args()
     if a.cmd == "cfg":
