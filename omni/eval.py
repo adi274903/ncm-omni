@@ -101,6 +101,54 @@ def cond_scores(model, sched, batch):
     return acc
 
 
+@torch.no_grad()
+def ar_cond_parity(model, sched, batch):
+    """AR scored with the SAME information the parallel arm has: the level's first slot only.
+
+    At slot 0 of level k a causal model has seen every coarser level and nothing of level k -
+    exactly the parallel arm's information set. At slot i>0 it also reads the i same-level slots
+    before it, which is context the parallel arm is architecturally denied: text L5 is 64 slots,
+    so a naive conditional comparison hands AR a 64-token language-modelling prefix. Both numbers
+    are reported; this one is the one that compares architectures.
+    """
+    logits = model(batch, use_flex=None)
+    acc = {}
+    for k in range(sched.K):
+        for m in sched.modalities:
+            l, off = sched.level_len(m, k), sched.offsets(m)[k]
+            if l < 1:
+                continue
+            gt = batch["codes"][m][:, off:off + 1]
+            keep = (gt != sched.null_code) & batch["present"][m].unsqueeze(1)
+            if not keep.any():
+                continue
+            pred = logits[(m, k)][:, :1].argmax(-1)
+            acc[(m, k)] = float((pred == gt)[keep].float().mean())
+    return acc
+
+
+def copy_prior(batch, sched):
+    """Accuracy of a pure copy model: repeat the previous slot in the same level.
+
+    This is the floor that matters for AR, because a causal model reads that previous slot for
+    free. A level sitting at its copy share was scored by repetition, not by using the coarser
+    levels - which is what a 0.95 on text L5 has to be checked against before it is quoted.
+    """
+    out = {}
+    for k in range(sched.K):
+        for m in sched.modalities:
+            l, off = sched.level_len(m, k), sched.offsets(m)[k]
+            if l < 2:
+                continue
+            gt = batch["codes"][m][:, off:off + l]
+            keep = (gt != sched.null_code) & batch["present"][m].unsqueeze(1)
+            nxt, kp = gt[:, 1:], keep[:, 1:]
+            if not kp.any():
+                continue
+            out[(m, k)] = float(((nxt == gt[:, :-1]) & kp).sum()) / int(kp.sum())
+    return out
+
+
 def summarise(acc, sched, n_levels):
     """Mean accuracy over generated levels + the coarsest and the finest generated level."""
     if not acc:
@@ -278,6 +326,34 @@ def run(cfg):
             print(f"| {name} | L{k} | {row} | {sum(got)/max(1,len(got)):.4f} | "
                   f"{base_lv[k]:.3f} |")
     print()
+    par = ar_cond_parity(ar, sched, batch) if ar is not None else {}
+    if par:
+        print("### AR at parity: level-first slot only, no same-level prefix "
+              "(the parallel arm's information)\n")
+        print("| arm | level | text | image | audio | video | mean |")
+        print("|---|---|---|---|---|---|---|")
+        for k in range(sched.K):
+            cells = [par.get((m, k)) for m in sched.modalities]
+            got = [c for c in cells if c is not None]
+            row = " | ".join("  -  " if c is None else f"{c:.3f}" for c in cells)
+            print(f"| autoregressive(parity) | L{k} | {row} | {sum(got)/max(1, len(got)):.4f} |")
+        print()
+
+    cp = copy_prior(batch, sched)
+    if cp:
+        print("### copy prior: accuracy of repeating the previous slot in the same level "
+              "(what AR reads for free)\n")
+        print("| level | text | image | audio | video | mean |")
+        print("|---|---|---|---|---|---|")
+        for k in range(sched.K):
+            cells = [cp.get((m, k)) for m in sched.modalities]
+            got = [c for c in cells if c is not None]
+            if not got:
+                continue
+            row = " | ".join("  -  " if c is None else f"{c:.3f}" for c in cells)
+            print(f"| L{k} | {row} | {sum(got)/len(got):.4f} |")
+        print()
+
     print("### free-running: sample from level 0, no teacher (the unconditional number)\n")
     print("| arm | NFE | mean acc | coarse | finest |")
     print("|---|---|---|---|---|")
@@ -302,14 +378,34 @@ def run(cfg):
                       if (m, fine) in cond["autoregressive"])
         ar_cond /= max(1, sum(1 for m in sched.modalities if (m, fine) in cond["autoregressive"]))
 
+    ar_par = None
+    if par:
+        ar_par = sum(par.get((m, fine), 0.0) for m in sched.modalities if (m, fine) in par)
+        ar_par /= max(1, sum(1 for m in sched.modalities if (m, fine) in par))
+    cp_fine = [v for (m, kk), v in cp.items() if kk == fine]
+    cp_mean = sum(cp_fine) / len(cp_fine) if cp_fine else None
+
     free_best = max([0.0] + [r["mean"] for r in table])
     lines = [f"conditional L{fine} ({'one forward' if True else ''}): {mine} {my_cond:.4f}"
              + (f" vs AR {ar_cond:.4f} ({sched.K} forwards vs {sum(sched.flat_len(m) for m in sched.modalities)})"
                 if ar_cond is not None else "")
              + f" | constant {base_lv[fine]:.4f}"]
+    if ar_par is not None:
+        lines.append(f"same metric, AR at parity (level-first slot, no same-level prefix): {ar_par:.4f}")
+    if cp_mean is not None:
+        lines.append(f"copy prior at L{fine} (repeat the previous slot): {cp_mean:.4f}")
     if my_cond <= base_lv[fine]:
         lines.append(f"VOID: the conditional finest level is at or below the constant predictor "
                      f"({base_lv[fine]:.4f}) - the model has not learned to use the coarser levels.")
+    elif ar_par is not None:
+        # The naive comparison hands AR the same-level slots before the one it is predicting.
+        # At parity that context is removed, so this is the number that ranks architectures.
+        d = my_cond - ar_par
+        if d >= 0:
+            lines.append(f"PARITY: at L{fine} the parallel arm is {d:+.4f} over AR once AR loses "
+                         f"its same-level prefix - the naive AR lead is context, not architecture.")
+        else:
+            lines.append(f"PARITY: AR is {-d:.4f} ahead at L{fine} even without same-level context.")
     margin = free_best - baseline
     if free_best <= baseline:
         tail = (" - VOID, and expected: level 0 is unpredictable, so this number measures "
@@ -325,6 +421,8 @@ def run(cfg):
     json.dump({"table": table, "conditional": {k: {f"{m}_L{kk}": v
                                                    for (m, kk), v in acc.items()}
                                                for k, acc in cond.items()},
+               "conditional_ar_parity": {f"{m}_L{kk}": v for (m, kk), v in par.items()},
+               "copy_prior": {f"{m}_L{kk}": v for (m, kk), v in cp.items()},
                "baseline": baseline, "baseline_by_level": base_lv, "summary": msg},
               open(cfg["out"], "w"), indent=2)
     print("wrote", cfg["out"])
