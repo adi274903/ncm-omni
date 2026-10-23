@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 
 import torch
@@ -258,6 +259,16 @@ def run_duplex(cfg, smoke=None):
                 torch.save({"model": models[arm].state_dict(), "cfg": cfg, "step": step},
                            os.path.join(d, f"step{step+1}.pt"))
 
+    # The live-stream generator holds 20 open Hub readers and daemon pump threads. Never closing
+    # it leaves the interpreter hanging after the last step (process alive, cell never returns),
+    # with the streams still attached. Closing runs its finally and stops the pumps.
+    close = getattr(rows, "close", None)
+    if close:
+        try:
+            close()
+        except Exception:                                          # noqa: BLE001
+            pass
+
     dt = time.time() - t0
     for arm in arms:
         d = os.path.join(out_dir, f"train_{arm}")
@@ -267,10 +278,17 @@ def run_duplex(cfg, smoke=None):
         print("saved", os.path.join(d, "final.pt"))
     print(f"DUPLEX {steps} steps | {dt/max(1, steps):.2f} s/step for {len(arms)} arms "
           f"| {toks/dt:.0f} pos/s | {steps*bs:,} samples seen once")
-    if smoke:
-        return
-    have = sorted(f for f in os.listdir(live_cfg["out_dir"]) if f.startswith("eval_"))
-    print("eval blocks:", have or "NONE")
+    if live_cfg:
+        have = sorted(f for f in os.listdir(live_cfg["out_dir"]) if f.startswith("eval_"))
+        print("eval blocks:", have or "NONE")
+    # Colab: closing the generator stops the pump threads, but the Hub readers and hf_xet keep
+    # file descriptors open and the interpreter never returns, so the cell sits RUNNING after
+    # "DUPLEX ... steps" with every checkpoint already on disk. This must come after the
+    # save flush and before any early return (--smoke used to return here and hang the same
+    # way). Everything is on disk by now; leave hard rather than hang a finished run.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 def main():
