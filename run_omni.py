@@ -146,6 +146,11 @@ def _nshards(d):
 
 def cmd_produce(args):
     cfg = default_cfg()
+    # ShardStream reads with consume=False, so shard files are never deleted: the rolling-buffer
+    # cap (max_ahead_shards) can only ever block forever once it is hit. Batch production wants
+    # the whole corpus on disk, so allow the cap to be raised explicitly.
+    if getattr(args, "max_ahead", 0):
+        cfg["produce"]["max_ahead_shards"] = int(args.max_ahead)
     paths = write_cfgs(cfg, budget=args.budget)
     os.makedirs(RUN, exist_ok=True)
     nworkers = max(1, args.workers)
@@ -290,6 +295,9 @@ def main():
     ap.add_argument("--foreground", action="store_true")
     ap.add_argument("--workers", type=int, default=1,
                     help="producer processes; each reads index i mod N of every stream")
+    ap.add_argument("--max-ahead", type=int, default=0,
+                    help="producer rolling-buffer cap in shards; 0 keeps the default 24, "
+                         "which blocks forever when nothing deletes shards (batch runs: 100000)")
     ap.add_argument("--wait-timeout", type=int, default=3600)
     a = ap.parse_args()
     if a.cmd == "cfg":
