@@ -100,7 +100,7 @@ def run(cfg, smoke=None):
             evals[group] = EvalSet(path)
     print("eval sets:", {g: len(d) for g, d in evals.items()})
 
-    stream = ShardStream(cfg["shard_dir"], consume=cfg.get("consume", True),
+    stream = ShardStream(cfg["shard_dir"], consume=cfg.get("consume", False),
                          start_sample=cfg.get("start_sample", 0),
                          producer_log=cfg.get("producer_log"),
                          timeout_s=cfg.get("stream_timeout", 600))

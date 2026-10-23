@@ -38,8 +38,11 @@ def rows_from_npz(z, meta, mods=MODALITIES):
 class ShardStream(IterableDataset):
     """Infinite-ish sampler over the producer's rolling shards."""
 
-    def __init__(self, shard_dir, consume=True, start_sample=0, poll=0.25,
+    def __init__(self, shard_dir, consume=False, start_sample=0, poll=0.25,
                  producer_log=None, timeout_s=None):
+        # consume=False by default: shards are the only copy of the data, and the two arms of the
+        # experiment must read the same rows. Deleting them after arm 1 leaves arm 2 with a
+        # truncated stream - which silently shortens its step budget instead of failing loudly.
         self.dir, self.consume, self.start = shard_dir, consume, start_sample
         self.poll, self.producer_log, self.timeout_s = poll, producer_log, timeout_s
 

@@ -32,7 +32,7 @@ def log(*a):
 
 
 # ------------------------------------------------------------------ sources
-def _s(path, **kw):
+def _s(path, split="train", **kw):
     """Streaming loader, resolved lazily so one bad dataset id cannot kill the producer.
 
     `path` (not `name`) so callers can pass the config through the `name=` keyword the way
@@ -40,7 +40,7 @@ def _s(path, **kw):
     """
     def load():
         from datasets import load_dataset
-        return load_dataset(path, split="train", streaming=True, **kw)
+        return load_dataset(path, split=split, streaming=True, **kw)
     return load
 
 
@@ -52,17 +52,29 @@ def _stream(name, config=None, take=None):
     return load
 
 
-def _first(ids, config=None):
-    """Try dataset ids in order; the first that opens wins. Stale ids degrade, never kill."""
+def _raw(ids, config=None, split="train", column=None, **kw):
+    """Like `_stream`, but leaves audio/video **undecoded**.
+
+    `datasets` >= 4 needs torchcodec to decode media columns, and torchcodec only matches a
+    narrow range of torch builds. We never want that dependency: the bytes go to soundfile
+    (`audio`) or PyAV (`video`) ourselves. Accepts a list of ids and tries them in order, so a
+    rename costs one group and not the run.
+    """
+    if isinstance(ids, str):
+        ids = [ids]
+
     def load():
-        from datasets import load_dataset
+        from datasets import features, load_dataset
+        feat = {"audio": features.Audio(decode=False),
+                "video": features.Video(decode=False)}.get(column)
         err = None
         for i in ids:
             try:
-                return load_dataset(i, config, split="train", streaming=True)
+                ds = load_dataset(i, config, split=split, streaming=True, **kw)
+                return ds.cast_column(column, feat) if feat else ds
             except Exception as e:                             # noqa: BLE001
                 err = e
-                log(f"[source] id {i} unavailable: {type(e).__name__}: {str(e)[:70]}")
+                log(f"[source] {i} ({split}) unavailable: {type(e).__name__}: {str(e)[:70]}")
         raise err
     return load
 
@@ -78,22 +90,38 @@ def _txt(ex):
 def _img_cap(ex):
     img = ex.get("image")
     if img is None:
+        img = ex.get("img")                                    # cifar-style column name
+    if img is None:
         return {}
     cap = ""
-    for k in ("text", "caption", "captions", "alt_text"):
+    for k in ("text", "caption", "captions", "alt_text", "label"):
         v = ex.get(k)
-        if isinstance(v, str):
+        if isinstance(v, str) and v.strip():
             cap = v
             break
-        if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
-            cap = v[0]
-            break
-    return {"image": img, "text": cap} if cap else {"image": img}
+    return {"image": img, "text": str(cap)} if cap else {"image": img}
+
+
+def _decode_audio(a):
+    """(raw bytes|path|already decoded) -> (float32 mono, sr). None means drop the sample."""
+    if isinstance(a, dict):
+        raw, path = a.get("bytes"), a.get("path")
+        try:
+            import io
+            import soundfile as sf
+            wav, sr = sf.read(io.BytesIO(raw) if raw else path, dtype="float32", always_2d=True)
+            return wav[:, 0], int(sr)
+        except Exception as e:                                 # noqa: BLE001
+            log(f"[audio] decode failed: {type(e).__name__}: {str(e)[:70]}")
+            return None
+    if isinstance(a, (list, tuple)) and len(a) == 2:
+        return np.asarray(a[0], dtype=np.float32).flatten(), int(a[1])
+    return None
 
 
 def _audio_text(ex):
-    a = ex.get("audio")
-    if a is None:
+    wav = _decode_audio(ex.get("audio"))
+    if wav is None:
         return {}
     t = ""
     for k in ("text", "transcription", "transcript", "sentence"):
@@ -101,7 +129,18 @@ def _audio_text(ex):
         if isinstance(v, str) and v.strip():
             t = v
             break
-    return {"audio": a, "text": t} if t else {"audio": a}
+    return {"audio": wav, "text": t} if t else {"audio": wav}
+
+
+def _local_path(src):
+    """hf://datasets/<repo>@<rev>/<file> -> a real local file PyAV can open."""
+    if not (isinstance(src, str) and src.startswith("hf://")):
+        return src
+    from huggingface_hub import hf_hub_download
+    body = src[len("hf://datasets/"):]
+    repo, rest = body.split("@", 1)
+    rev, fname = rest.split("/", 1)
+    return hf_hub_download(repo_id=repo, filename=fname, repo_type="dataset", revision=rev)
 
 
 def _video_frames(ex, max_frames=8):
@@ -115,11 +154,12 @@ def _video_frames(ex, max_frames=8):
         try:
             import io
             import av
-            src = v.get("bytes") if isinstance(v, dict) else None
+            src = v.get("bytes") if isinstance(v, dict) else v
             if not src:
                 src = v.get("path") if isinstance(v, dict) else v
             if isinstance(src, (bytes, bytearray)):
                 src = io.BytesIO(src)
+            src = _local_path(src)
             if src is None:
                 return {}
             frames = []
@@ -138,23 +178,25 @@ def _video_frames(ex, max_frames=8):
     return {"video": frames, "text": t} if isinstance(t, str) and t.strip() else {"video": frames}
 
 
-# name -> (group, loader, extractor). Anything that fails to open is skipped with a log line,
-# so a stale dataset id degrades the mixture instead of killing the run.
+# name -> (loader, extractor). Anything that fails to open is skipped with a log line, so a stale
+# dataset id degrades the mixture instead of killing the run.
+#
+# Every id here was opened against the live Hub: the pokemon and flickr30k ids that used to sit
+# here are gated and script-based respectively, so neither streams at all any more.
 SOURCES = {
-    "text_fineweb":  (_stream("HuggingFaceFW/fineweb-edu", "sample-10BT"), _txt),
-    "text_wikitext": (_stream("Salesforce/wikitext", "wikitext-103-raw-v1"), _txt),
-    "image_pokemon": (_s("lambdalabs/pokemon-blip-captions"), _img_cap),
-    "image_flickr":  (_s("nlphuji/flickr30k"), _img_cap),
-    "audio_dummy":   (_s("hf-internal-testing/librispeech_asr_dummy", name="clean"), _audio_text),
-    "audio_libri":   (_stream("openslr/librispeech_asr", "clean"), _audio_text),
-    # video ids are the least stable thing in this file: `_first` tries each and logs what failed,
-    # so a rename costs the video group and nothing else.
-    "video_ucf":     (_first(["sayakpaul/ucf101-subset",
-                              "HuggingFaceM4/webvid",
-                              "hf-internal-testing/small-video-dataset"]), _video_frames),
+    "text_fineweb":   (_stream("HuggingFaceFW/fineweb-edu", "sample-10BT"), _txt),
+    "text_wikitext":  (_stream("Salesforce/wikitext", "wikitext-103-raw-v1"), _txt),
+    "image_cifar10":  (_s("uoft-cs/cifar10"), _img_cap),
+    "image_cifar100": (_s("uoft-cs/cifar100"), _img_cap),
+    "audio_dummy":    (_raw("hf-internal-testing/librispeech_asr_dummy", "clean", "validation",
+                            column="audio"), _audio_text),
+    "audio_libri":    (_raw("openslr/librispeech_asr", "clean", "train.100",
+                            column="audio"), _audio_text),
+    "video_ucf":      (_raw(["nateraw/kinetics-mini", "sayakpaul/ucf101-subset"],
+                            column="video"), _video_frames),
 }
 GROUPS = {"text_fineweb": "text", "text_wikitext": "text",
-          "image_pokemon": "image", "image_flickr": "image",
+          "image_cifar10": "image", "image_cifar100": "image",
           "audio_dummy": "audio", "audio_libri": "audio",
           "video_ucf": "video"}
 

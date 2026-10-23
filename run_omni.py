@@ -32,15 +32,15 @@ def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
         produce=dict(out_dir=out, sample_budget=budget, shard_samples=64,
                      max_ahead_shards=24, shuffle_buf=512, batch_docs=8, seed=3407,
                      holdout=dict(text=32, image=24, audio=16, video=8),
-                     mix=dict(text_fineweb=0.42, text_wikitext=0.09, image_pokemon=0.09,
-                              image_flickr=0.18, audio_libri=0.09, audio_dummy=0.05,
+                     mix=dict(text_fineweb=0.42, text_wikitext=0.09, image_cifar10=0.09,
+                              image_cifar100=0.18, audio_libri=0.09, audio_dummy=0.05,
                               video_ucf=0.08),
                      codebook_size=256, prefer_real=True,
                      K=None, R=None, base_len=None),
     )
 
 
-def write_cfgs(cfg, budget=None):
+def write_cfgs(cfg, budget=None, steps=None):
     from omni.schedule import OmniSchedule
     os.makedirs(os.path.join(RUN, "cfg"), exist_ok=True)
     sch = cfg["sched"]
@@ -61,6 +61,8 @@ def write_cfgs(cfg, budget=None):
 
     for arm, mode in (("train_block", "block"), ("train_ar", "ar")):
         t = dict(cfg["train"])
+        if steps:
+            t["steps"] = int(steps)
         t.update(sched=sch, vocab=cfg["vocab"],
                  model=dict(cfg["model"], mask_mode=mode),
                  out_dir=os.path.join(RUN, arm),
@@ -68,6 +70,7 @@ def write_cfgs(cfg, budget=None):
                  producer_log=os.path.join(RUN, "producer.log"),
                  eval_files={g: os.path.join(prod["out_dir"], f"eval_{g}.npz")
                              for g in prod["holdout"]},
+                 consume=False,          # both arms read the same shards
                  stream_timeout=1800)
         json.dump(t, open(paths[arm], "w"), indent=2)
 
@@ -143,7 +146,7 @@ def cmd_produce(args):
 
 def cmd_train(args):
     cfg = default_cfg()
-    paths = write_cfgs(cfg)
+    paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
     which = paths["train_ar"] if args.arm == "ar" else paths["train_block"]
     cmd = [sys.executable, "-m", "omni.train", which]
     if args.smoke:
@@ -160,7 +163,7 @@ def cmd_eval(args):
 def cmd_all(args):
     """Producer in the background, then wait for the held-out blocks, then both arms, then eval."""
     cfg = default_cfg()
-    paths = write_cfgs(cfg, budget=args.budget)
+    paths = write_cfgs(cfg, budget=args.budget, steps=args.steps)
     os.makedirs(RUN, exist_ok=True)
     stream_dir = cfg["produce"]["out_dir"]
     log = open(os.path.join(RUN, "producer.log"), "w")
@@ -196,6 +199,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["check", "produce", "train", "eval", "all", "cfg"])
     ap.add_argument("--budget", type=int, default=None)
+    ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--smoke", type=int, default=0)
     ap.add_argument("--arm", choices=["block", "ar"], default="block")
     ap.add_argument("--foreground", action="store_true")
