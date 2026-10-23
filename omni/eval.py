@@ -294,10 +294,16 @@ def run(cfg):
     if my_cond <= base_lv[fine]:
         lines.append(f"VOID: the conditional finest level is at or below the constant predictor "
                      f"({base_lv[fine]:.4f}) - the model has not learned to use the coarser levels.")
-    lines.append(f"free-running best = {free_best:.4f} (constant {baseline:.4f})"
-                 + ("" if free_best > baseline else
-                    " - VOID, and expected: level 0 is unpredictable, so this number measures "
-                    "the propagation of the first wrong guess, not the architecture."))
+    margin = free_best - baseline
+    if free_best <= baseline:
+        tail = (" - VOID, and expected: level 0 is unpredictable, so this number measures "
+                "the propagation of the first wrong guess, not the architecture.")
+    elif margin < 0.05:
+        tail = (f" - margin {margin:+.4f} on a 48-row set is inside the sampling noise "
+                f"(SE ~0.05 per slot): a tie, not a win. Do not quote it.")
+    else:
+        tail = f" - margin {margin:+.4f}, outside noise."
+    lines.append(f"free-running best = {free_best:.4f} (constant {baseline:.4f})" + tail)
     msg = "\n".join(lines)
     print("\n" + msg)
     json.dump({"table": table, "conditional": {k: {f"{m}_L{kk}": v
