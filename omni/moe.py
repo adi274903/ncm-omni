@@ -45,21 +45,30 @@ class ModalityExperts(nn.Module):
         self.w_up = nn.ModuleList([nn.Linear(n_embd, h) for _ in range(n_experts)])
         self.w_down = nn.ModuleList([nn.Linear(h, n_embd) for _ in range(n_experts)])
 
-    def forward(self, x, mod_id):
-        """x = [B, T, d], mod_id = [T] expert index per packed position -> [B, T, d]."""
+    def forward(self, x, mod_id, plan=None):
+        """x = [B, T, d], mod_id = [T] expert index per packed position -> [B, T, d].
+
+        `plan` is the per-expert position index, precomputed once with the routing tensor. Routing
+        is a pure function of the schedule, so it never changes between steps: computing
+        `(mod_id == e).nonzero()` here instead would be 3 kernels per block per step, and the
+        `if not bool(sel.any()): continue` this replaces was a device sync plus a dynamo graph
+        break in the middle of the forward - same bug the training loss had.
+        """
         B, T, d = x.shape
         if mod_id is None:
             raise ValueError("ModalityExperts needs mod_id; forced routing has no fallback")
         if mod_id.dim() != 1 or mod_id.numel() != T:
             raise ValueError(f"mod_id must be [T] with T={T}, got {tuple(mod_id.shape)}")
+        if plan is None:
+            plan = tuple((mod_id == e).nonzero(as_tuple=False).squeeze(1)
+                         for e in range(self.n_experts))
         out = x.new_zeros(B, T, d)
-        for e in range(self.n_experts):
-            sel = mod_id == e
-            if not bool(sel.any()):
-                continue                                   # expert got no tokens this batch
-            xe = x[:, sel, :]
+        for e, idx in enumerate(plan):
+            if idx.numel() == 0:
+                continue                                   # expert got no tokens: host-side shape
+            xe = x.index_select(1, idx)
             ye = self.w_down[e](F.silu(self.w_gate[e](xe)) * self.w_up[e](xe))
-            out[:, sel, :] = ye.to(out.dtype)          # autocast emits bf16, out is fp32
+            out.index_copy_(1, idx, ye.to(out.dtype))      # autocast emits bf16, out is fp32
         return out
 
     @torch.no_grad()
@@ -84,9 +93,9 @@ class MoEBlock(nn.Module):
                 delattr(base, name)                        # frees the dense FFN, not just ignores it
         self.experts = ModalityExperts(n_embd, n_experts, mlp_ratio)
 
-    def forward(self, x, block_mask=None, dense_mask=None, rope=None, mod_id=None):
+    def forward(self, x, block_mask=None, dense_mask=None, rope=None, mod_id=None, plan=None):
         x = x + self.attn(self.ln1(x), block_mask=block_mask, dense_mask=dense_mask, rope=rope)
-        return x + self.experts(self.ln2(x), mod_id)
+        return x + self.experts(self.ln2(x), mod_id, plan)
 
 
 def active_params(model):

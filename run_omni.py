@@ -44,6 +44,8 @@ def apply_overrides(cfg, a):
         cfg["train"].update(batch=p["batch"], lr=p["lr"], warmup=p["warmup"])
     if getattr(a, "batch", 0):
         cfg["train"]["batch"] = int(a.batch)
+    if getattr(a, "no_compile", False):
+        cfg["train"]["compile"] = False
     if getattr(a, "save_every", None):
         cfg["train"]["save_every"] = int(a.save_every)
     if getattr(a, "log_every", None):
@@ -95,7 +97,7 @@ def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
         model=dict(n_embd=384, n_layer=6, n_head=6, n_kv_head=2, dropout=0.0,
                    qk_norm=True, mask_mode="block"),
         train=dict(steps=2000, batch=8, lr=3e-4, warmup=100, wd=0.01, clip=1.0,
-                   log_every=10, eval_every=1000, save_every=500),
+                   log_every=10, eval_every=1000, save_every=500, compile=True),
         produce=dict(out_dir=out, sample_budget=budget, shard_samples=64,
                      max_ahead_shards=24, shuffle_buf=512, batch_docs=8, seed=3407,
                      holdout=dict(text=32, image=24, audio=16),
@@ -434,7 +436,14 @@ def main(argv=None):
                          "0 keeps 64 (504 packed positions). 1024 => ~7.1k positions")
     ap.add_argument("--holdout-mult", type=int, default=0,
                     help="multiply the held-out block sizes (4 => 128/96/64/32, SE ~0.028)")
-    ap.add_argument("--batch", type=int, default=0)
+    ap.add_argument("--batch", type=int, default=0,
+                    help="micro-batch. This is the dominant throughput knob: the step is "
+                         "launch-bound long before it is FLOP-bound, so 8 -> 32-64 buys most of "
+                         "the missing TFLOPS. Raise lr ~sqrt(batch/8) when you do.")
+    ap.add_argument("--no-compile", action="store_true", dest="no_compile",
+                    help="train eager instead of torch.compile(model). Measured on an 8 GB "
+                         "RTX 3070 laptop it is 1.7x slower per step (186 vs 323 ms at "
+                         "batch 16) and needs more VRAM; compile costs ~8-75 s at startup")
     ap.add_argument("--max-ahead", type=int, default=0,
                     help="producer rolling-buffer cap in shards; 0 keeps the default 24, "
                          "which blocks forever when nothing deletes shards (batch runs: 100000)")

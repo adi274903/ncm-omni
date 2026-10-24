@@ -44,6 +44,78 @@ def fast_math():
                 tf32=True)
 
 
+def adamw(params, cfg):
+    """Fused AdamW when the build has it: one kernel over the whole parameter list instead of
+    ~4 python-driven launches per tensor. At ~90 tensors that is a real slice of the step."""
+    kw = dict(lr=cfg.get("lr", 3e-4), betas=(0.9, 0.95), weight_decay=cfg.get("wd", 0.01))
+    if torch.cuda.is_available():
+        try:
+            return torch.optim.AdamW(params, fused=True, **kw)
+        except (TypeError, RuntimeError, AssertionError) as e:      # pragma: no cover
+            print(f"!! fused AdamW unavailable ({e}); using the eager optimiser")
+    return torch.optim.AdamW(params, **kw)
+
+
+def step_flops(P, bs, T, mult=1.0):
+    """6*N*D per training step (2N forward + 4N backward) - the MFU convention, no sync."""
+    return 6.0 * P * bs * T * mult
+
+
+def warm_batch(sched, ocfg, B, device):
+    """A batch that is legal for a heterogeneous head: every level's target is < that level's
+    vocab. `synthetic_batch` draws from the widest codebook, which the 256-way L0 head rejects."""
+    g = torch.Generator().manual_seed(0)
+    codes, present = {}, {}
+    for m in sched.modalities:
+        flat = torch.zeros(B, sched.flat_len(m), dtype=torch.long)
+        for k in range(sched.K):
+            l, off = sched.level_len(m, k), sched.offsets(m)[k]
+            flat[:, off:off + l] = torch.randint(1, ocfg.vocab_at(m, k), (B, l), generator=g)
+        codes[m] = flat.to(device)
+        present[m] = torch.ones(B, dtype=torch.bool, device=device)
+    return {"codes": codes, "present": present}
+
+
+def prepare(model, cfg, sched, bs, dev):
+    """-> the callable to use for the forward (compiled when available, else the raw module).
+
+    torch.compile fuses the ~10 small kernels per block (two RMSNorms, RoPE, the SiLU gate, the
+    residual adds) and is the only way flex_attention runs as a fused kernel. It is compiled HERE
+    on a synthetic batch, for three reasons: a graph break or an unsupported mask costs a warning
+    instead of a silent 8x slowdown at step 0; the compile time lands before the timed loop so
+    pos/s is not nonsense; and checkpoints are still saved from the raw module, so `_orig_mod.`
+    never leaks into a state_dict that omni/eval.py has to load.
+    """
+    if not cfg.get("compile", True) or dev != "cuda":
+        return model
+    # A broken subgraph (older inductor builds mis-codegen flex_attention for tiny shapes) should
+    # cost speed on that subgraph, not the whole run. suppress_errors falls back to eager per
+    # frame; the try/except below still catches a failure at compile time.
+    torch._dynamo.config.suppress_errors = True
+    t0, amp = time.time(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True)
+    try:
+        fwd = torch.compile(model, dynamic=False)
+        batch = warm_batch(sched, model.cfg, bs, dev)
+        with amp:
+            loss = omni_loss(fwd(batch), batch, sched)
+        loss.backward()                                     # compiles the backward graph too
+        model.zero_grad(set_to_none=True)
+        model.eval()
+        with torch.no_grad(), amp:
+            fwd(batch)                                      # eval graph, same shapes
+        model.train()
+        g = torch._dynamo.utils.counters["stats"]
+        print(f"torch.compile: ready in {time.time() - t0:.0f}s "
+              f"({g.get('unique_graphs', 0)} graphs, {g.get('frames_compiled', 0)} frames "
+              f"compiled, {g.get('frames_total', 0)} seen)")
+        return fwd
+    except Exception as e:                                      # noqa: BLE001
+        print(f"!! torch.compile failed ({type(e).__name__}: {e}); training eager")
+        model.zero_grad(set_to_none=True)
+        model.train()
+        return model
+
+
 def build(cfg):
     sch = cfg["sched"]
     sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
@@ -93,6 +165,18 @@ def preflight_gate(cfg, writer=None):
 
 def n_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def flop_params(model):
+    """Parameters a token actually flows through, which is what the TFLOPS column must divide by.
+
+    With modality-routed experts `n_params` counts every expert while a synthetic batch only
+    routes to a few, so using it inflates the number by the ratio of experts to active experts.
+    """
+    if getattr(model, "moe", False):
+        from omni.moe import active_params
+        return active_params(model)
+    return n_params(model)
 
 
 def lr_at(step, cfg):
@@ -152,7 +236,11 @@ def run(cfg, smoke=None):
     model, sched = build(cfg)
     model.to(dev).train()
     P = n_params(model)
+    Pf = flop_params(model)
     T = sched.total_len
+    bs = cfg.get("batch", 4)
+    if dev == "cuda":
+        print("fast math:", fast_math())
     print(f"params {P/1e6:.2f}M | packed positions/sample {T} | modalities {list(sched.modalities)}")
     print(sched.describe())
 
@@ -166,14 +254,13 @@ def run(cfg, smoke=None):
                          start_sample=cfg.get("start_sample", 0),
                          producer_log=cfg.get("producer_log"),
                          timeout_s=cfg.get("stream_timeout", 600))
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 3e-4),
-                            betas=(0.9, 0.95), weight_decay=cfg.get("wd", 0.01))
+    opt = adamw(model.parameters(), cfg)
     steps = smoke or cfg["steps"]
-    bs = cfg.get("batch", 4)
     ckpt_dir = os.path.join(out_dir, "ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
     metrics = open(os.path.join(out_dir, "metrics.jsonl"), "a")
     use_bf16 = dev == "cuda"
+    fwd = prepare(model, cfg, sched, bs, dev)
 
     it = iter(stream)
     t0, toks = time.time(), 0
@@ -193,17 +280,20 @@ def run(cfg, smoke=None):
         for g in opt.param_groups:
             g["lr"] = lr_at(step, {**cfg, "steps": steps})
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-            logits = model(batch)
+            logits = fwd(batch)
             loss = omni_loss(logits, batch, sched, label_smoothing=cfg.get("label_smoothing", 0.0))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("clip", 1.0))
         opt.step()
         toks += bs * T
+        el = time.time() - t0
         rec = dict(step=step, loss=float(loss.detach()), grad_norm=float(gn.detach()),
                    lr=opt.param_groups[0]["lr"],
-                   samples_per_s=round((step + 1) / (time.time() - t0), 2),
-                   pos_per_s=round(toks / (time.time() - t0), 1))
+                   samples_per_s=round(toks / T / el, 2),   # toks/T is samples, not steps
+                   steps_per_s=round((step + 1) / el, 2),
+                   pos_per_s=round(toks / el, 1),
+                   tflops=round(step_flops(Pf, bs, T) * (step + 1) / el / 1e12, 2))
         if writer is not None and (step % max(1, cfg.get("log_every", 10)) == 0
                                    or step == steps - 1):
             with torch.no_grad():
@@ -212,15 +302,17 @@ def run(cfg, smoke=None):
             writer.add_scalar("train/grad_norm", float(gn), step)
             writer.add_scalar("train/lr", rec["lr"], step)
             writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
+            writer.add_scalar("perf/tflops", rec["tflops"], step)
             for (mm, kk), v in st.items():
                 writer.add_scalar(f"train/ce/{mm}_L{kk}", v["ce"], step)
-        pbar.set_postfix(loss=f"{rec['loss']:.4f}", pos_s=rec["pos_per_s"])
+        pbar.set_postfix(loss=f"{rec['loss']:.4f}", pos_s=rec["pos_per_s"],
+                         tflops=rec["tflops"])
         if step % cfg.get("log_every", 10) == 0 or step == steps - 1:
             metrics.write(json.dumps(rec) + "\n")
             metrics.flush()
             pbar.write(json.dumps(rec))
         if evals and cfg.get("eval_every") and (step + 1) % cfg["eval_every"] == 0:
-            ev = evaluate(model, evals, sched, dev, bs)
+            ev = evaluate(fwd, evals, sched, dev, bs)
             metrics.write(json.dumps(dict(step=step, val=ev)) + "\n")
             metrics.flush()
             fin = {k: round(v["acc"], 4) for k, v in ev.items()}
@@ -232,7 +324,8 @@ def run(cfg, smoke=None):
     if smoke:
         sps = dt / max(1, steps)
         print(f"SMOKE {steps} steps | {sps:.2f} s/step | "
-              f"{toks/dt:.0f} pos/s | projected {sps*cfg['steps']/3600:.2f} h for {cfg['steps']} steps")
+              f"{toks/dt:.0f} pos/s | {step_flops(Pf, bs, T) / sps / 1e12:.1f} TFLOPS | "
+              f"projected {sps*cfg['steps']/3600:.2f} h for {cfg['steps']} steps")
         print(f"cost at $2.13/h on-demand H100: ${sps*cfg['steps']/3600*2.13:.0f}  "
               f"(at $1.00/h spot: ${sps*cfg['steps']/3600*1.0:.0f})")
         return
@@ -261,7 +354,7 @@ def run_duplex(cfg, smoke=None):
     if dev == "cuda":
         print("fast math:", fast_math())
 
-    models, opts, sched, arm_cfg = {}, {}, None, {}
+    models, opts, fwds, sched, arm_cfg = {}, {}, {}, None, {}
     for arm in arms:
         c = copy.deepcopy(cfg)
         c["model"]["mask_mode"] = arm
@@ -272,11 +365,13 @@ def run_duplex(cfg, smoke=None):
         m, s = build(c)
         m.to(dev).train()
         models[arm] = m
-        opts[arm] = torch.optim.AdamW(m.parameters(), lr=cfg.get("lr", 3e-4),
-                                      betas=(0.9, 0.95), weight_decay=cfg.get("wd", 0.01))
+        opts[arm] = adamw(m.parameters(), cfg)
         sched = sched or s
         print(f"{arm:6s} params {n_params(m)/1e6:.2f}M")
     T = sched.total_len
+    for arm in arms:                      # after sched exists: prepare() needs the packed length
+        fwds[arm] = prepare(models[arm], cfg, sched, bs, dev)
+    per_step = sum(step_flops(flop_params(models[a]), bs, T) for a in arms)
     print(f"packed positions/sample {T} | arms {arms} | single pass over the live stream")
 
     evals = {}
@@ -313,12 +408,12 @@ def run_duplex(cfg, smoke=None):
         if len(batch_rows) < bs:
             break
         batch = to_device(collate(batch_rows, sched), dev)
-        rec = {"step": step}
+        rec: dict = {"step": step}
         for arm in arms:
             for g in opts[arm].param_groups:
                 g["lr"] = lr_at(step, {**cfg, "steps": steps})
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                logits = models[arm](batch)
+                logits = fwds[arm](batch)
                 loss = omni_loss(logits, batch, sched,
                                  label_smoothing=cfg.get("label_smoothing", 0.0))
             opts[arm].zero_grad(set_to_none=True)
@@ -337,10 +432,12 @@ def run_duplex(cfg, smoke=None):
                     writer.add_scalar(f"{arm}/ce/{mm}_L{kk}", v["ce"], step)
         toks += bs * T
         rec["pos_per_s"] = round(toks / (time.time() - t0), 1)
+        rec["tflops"] = round(per_step * (step + 1) / (time.time() - t0) / 1e12, 2)
         if writer is not None:
             writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
+            writer.add_scalar("perf/tflops", rec["tflops"], step)
         pbar.set_postfix({a: f"{rec[a]:.4f}" for a in arms},
-                         pos_s=rec["pos_per_s"])
+                         pos_s=rec["pos_per_s"], tflops=rec["tflops"])
         if step % max(1, cfg.get("log_every", 10)) == 0 or step == steps - 1:
             pbar.write(json.dumps(rec))
             for arm in arms:

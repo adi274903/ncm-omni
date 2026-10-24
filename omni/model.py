@@ -116,8 +116,66 @@ def level_ids_for(sched: OmniSchedule, T: int, device="cpu"):
     return lev[:T].to(device), mod[:T].to(device), pos[:T].to(device)
 
 
+_CACHE_MAX = 8                   # entries for the two caches below
+_MASK_CACHE_BYTES = 64 << 20     # a T=7119 fp32 mask is 202 MB: rebuild it rather than pin it
+
+
+def _geometry(sched: OmniSchedule):
+    """Everything a per-T tensor depends on, as a hashable key.
+
+    Not `id(sched)`: a schedule rebuilt from the same cfg between calls must hit the same entry.
+    """
+    return (tuple(sorted(sched.base_len.items())), sched.K, sched.R,
+            sched.prefix_len, tuple(sched.modalities), sched.null_code)
+
+
+_STATIC = {}                     # (geometry, T, device, head_dim, emap) -> lev, mod, pos, rope, eid
+_MASK_CACHE = OrderedDict()      # dense additive masks: pure functions of (schedule, T, mode)
+
+
+def static_tensors(sched: OmniSchedule, T: int, device, head_dim: int, emap=None):
+    """Level ids, positional ids, RoPE tables and expert routing for a packed length T.
+
+    Built once instead of once per step. encode() used to rebuild all of it on every call: three
+    fresh tensors and their host->device copies, a python loop over the modality masks, and two
+    sin/cos tables over T positions. They are pure functions of the schedule and T, so at 0.18 s
+    per step that was pure launch overhead that never touched the maths.
+    """
+    key = (_geometry(sched), int(T), str(device), int(head_dim),
+           None if emap is None else tuple(emap))
+    hit = _STATIC.get(key)
+    if hit is None:
+        lev, mod, pos = level_ids_for(sched, T, device)
+        eid = None
+        if emap is not None:
+            eid = torch.zeros_like(mod)
+            for i, ex in enumerate(emap):        # prefix slots (-1) stay on expert 0
+                eid[mod == i] = ex
+        # per-expert position index, so the MoE path never branches on tensor values
+        plan = None
+        if eid is not None and emap is not None:
+            plan = tuple((eid == e).nonzero(as_tuple=False).squeeze(1)
+                         for e in range(max(emap) + 1))
+        hit = (lev, mod, pos, precompute_rope_cos_sin(pos, head_dim), eid, plan)
+        if len(_STATIC) >= _CACHE_MAX:
+            _STATIC.pop(next(iter(_STATIC)))
+        _STATIC[key] = hit
+    return hit
+
+
 def trunc_mask(sched: OmniSchedule, T: int, dtype=torch.float32, device="cpu",
                cross_level=False, mask_mode="block"):
+    """Additive [1,1,T,T] mask, cached per (T, dtype, device, mask mode).
+
+    Cached because it is a pure function of the schedule and T, and it used to be allocated and
+    filled from scratch every step: a T x T zero tensor, a masked_fill_ and a view, i.e. ~400 KB
+    of allocator churn plus two kernels whose result cannot change between steps.
+    """
+    key = (_geometry(sched), int(T), str(dtype), str(device), bool(cross_level), mask_mode)
+    hit = _MASK_CACHE.get(key)
+    if hit is not None:
+        _MASK_CACHE.move_to_end(key)
+        return hit
     lev, _, _ = level_ids_for(sched, T, device)
     q, kv = lev[:, None], lev[None, :]
     if mask_mode == "ar":
@@ -136,7 +194,12 @@ def trunc_mask(sched: OmniSchedule, T: int, dtype=torch.float32, device="cpu",
             allowed = allowed | ((q >= 0) & (kv >= 0) & (kv < q))
     m = torch.zeros(T, T, dtype=dtype, device=device)
     m.masked_fill_(~allowed, float("-inf"))
-    return m.view(1, 1, T, T)
+    m = m.view(1, 1, T, T)
+    if T * T * m.element_size() <= _MASK_CACHE_BYTES:
+        _MASK_CACHE[key] = m
+        while len(_MASK_CACHE) > _CACHE_MAX:
+            _MASK_CACHE.popitem(last=False)
+    return m
 
 
 def kv_ids(lev):                                            # kept for clarity in trunc_mask
@@ -311,21 +374,15 @@ class OmniNCM(nn.Module):
                                           cross_level, mask_mode)
         else:
             kw["dense_mask"] = trunc_mask(self.sched, T, x.dtype, x.device, cross_level, mask_mode)
-        lev, mod, pos = level_ids_for(self.sched, T, x.device)
-        rope = precompute_rope_cos_sin(pos, self.cfg.n_embd // self.cfg.n_head)
-        eid = self._expert_ids(mod) if self.moe else None
+        lev, mod, pos, rope, eid, plan = static_tensors(
+            self.sched, T, x.device, self.cfg.n_embd // self.cfg.n_head,
+            tuple(self._emap) if self._emap is not None else None)
         h = x
         for b in self.blocks:
-            h = b(h, rope=rope, mod_id=eid, **kw) if self.moe else b(h, rope=rope, **kw)
+            h = b(h, rope=rope, mod_id=eid, plan=plan, **kw) if self.moe \
+                else b(h, rope=rope, **kw)
         return self.ln_f(h)
 
-    def _expert_ids(self, mod):
-        """Packed modality index -> expert index. Prefix slots take expert 0."""
-        assert self._emap is not None
-        e = torch.zeros_like(mod)
-        for i, ex in enumerate(self._emap):
-            e[mod == i] = ex
-        return e
 
     def forward(self, batch, cross_level=False, use_flex=None):
         """batch = {"codes": {m: [B,flat]}, "present": {m: [B] bool}} -> {(m,k): logits}."""
@@ -399,16 +456,21 @@ def spread(stop, dummy_level):
 
 # ---------------------------------------------------------------------- loss
 def omni_loss(logits, batch, sched: OmniSchedule, label_smoothing=0.0, chunk=None):
-    """CE over every present, non-null code. Absent modalities and padded slots are masked."""
+    """CE over every present, non-null code. Absent modalities and padded slots are masked.
+
+    Sync-free on purpose: the divisor is accumulated as a tensor and an all-masked level is
+    zeroed with torch.where instead of `if not keep.any(): continue`. Each of those old branches
+    was a device-wide barrier in the middle of the graph - 18 of them per step at K=6, three
+    modalities - so the forward could never be queued ahead of the host. The sum is identical.
+    """
     codes, pres = batch["codes"], batch["present"]
-    total, n = None, 0
+    total, n = None, None
     for k in range(sched.K):
         for m in sched.modalities:
             l, off = sched.level_len(m, k), sched.offsets(m)[k]
             tg = codes[m][:, off:off + l]
             keep = (tg != sched.null_code) & pres[m].unsqueeze(1)
-            if not keep.any():
-                continue
+            cnt = keep.sum()
             lg = logits[(m, k)]
             flat_lg = lg.reshape(-1, lg.size(-1))
             flat_keep = keep.reshape(-1)
@@ -425,9 +487,13 @@ def omni_loss(logits, batch, sched: OmniSchedule, label_smoothing=0.0, chunk=Non
             else:
                 loss_k = F.cross_entropy(flat_lg, flat_tg, reduction="sum",
                                          ignore_index=-100, label_smoothing=label_smoothing)
+            # every target masked -> CE is nan; contribute nothing instead of poisoning the mean
+            loss_k = torch.where(cnt > 0, loss_k, loss_k.new_zeros(()))
             total = loss_k if total is None else total + loss_k
-            n += int(flat_keep.sum())
-    return (total / max(1, n)) if total is not None else torch.zeros((), device=next(iter(codes.values())).device)
+            n = cnt if n is None else n + cnt
+    if total is None or n is None:
+        return torch.zeros((), device=self_dev(codes))
+    return total / n.clamp(min=1)
 
 
 def omni_loss_stats(logits, batch, sched: OmniSchedule, label_smoothing=0.0):
