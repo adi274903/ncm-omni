@@ -16,7 +16,7 @@ import time
 import torch
 from tqdm.auto import tqdm
 
-from omni.data import EvalSet, ShardStream, collate, schedule_from_meta, to_device
+from omni.data import EvalSet, RowsSet, ShardStream, collate, schedule_from_meta, to_device
 from omni.model import OmniConfig, OmniNCM, omni_loss, omni_loss_stats
 from omni.schedule import MODALITIES, OmniSchedule
 
@@ -92,6 +92,13 @@ def prepare(model, cfg, sched, bs, dev):
     # cost speed on that subgraph, not the whole run. suppress_errors falls back to eager per
     # frame; the try/except below still catches a failure at compile time.
     torch._dynamo.config.suppress_errors = True
+    try:
+        # `suppress_errors` falls back per frame but still logs a full traceback for every frame it
+        # gives up on - on this config that is four frames and ~1,500 lines per run, which buries
+        # the loss records the run exists to print. Keep the fallback, drop the narration.
+        torch._logging.set_logs(dynamo=40)          # 40 = logging.ERROR
+    except Exception:                                # noqa: BLE001 - never let logging break a run
+        pass
     t0, amp = time.time(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=True)
     try:
         fwd = torch.compile(model, dynamic=False)
@@ -128,7 +135,8 @@ def build(cfg):
     ocfg = OmniConfig(sched, vocab, n_embd=m["n_embd"], n_layer=m["n_layer"],
                       n_head=m["n_head"], n_kv_head=m["n_kv_head"], dropout=m.get("dropout", 0.0),
                       qk_norm=m.get("qk_norm", True), mask_mode=m.get("mask_mode", "block"),
-                      n_experts=m.get("n_experts", 0), expert_map=m.get("expert_map"))
+                      n_experts=m.get("n_experts", 0), expert_map=m.get("expert_map"),
+                      moe_ffn=m.get("moe_ffn", 0), use_flex=m.get("use_flex"))
     return OmniNCM(ocfg), sched
 
 
@@ -227,7 +235,14 @@ def evaluate(model, evals, sched, device, batch_size=8):
     return out
 
 
-def run(cfg, smoke=None):
+def run(cfg, smoke=None, feed=None, eval_rows=None):
+    """Single training arm.
+
+    `feed` is an iterator of encoded rows and replaces the shard stream entirely: the notebook
+    trains straight off the live feed, so there is no produce step, no run/stream, no DONE marker
+    and nothing on disk to go stale. `eval_rows` is a fixed in-memory holdout taken from that same
+    feed, which keeps validation loss comparable across a run.
+    """
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
@@ -248,12 +263,17 @@ def run(cfg, smoke=None):
     for group, path in (cfg.get("eval_files") or {}).items():
         if os.path.exists(path):
             evals[group] = EvalSet(path)
-    print("eval sets:", {g: len(d) for g, d in evals.items()})
-
-    stream = ShardStream(cfg["shard_dir"], consume=cfg.get("consume", False),
-                         start_sample=cfg.get("start_sample", 0),
-                         producer_log=cfg.get("producer_log"),
-                         timeout_s=cfg.get("stream_timeout", 600))
+    if eval_rows:
+        evals["direct"] = RowsSet(eval_rows)
+    print("eval sets:", {g: len(d) for g, d in evals.items()} or "none - no validation")
+    if feed is not None:
+        it = iter(feed)
+        print(f"data: direct feed | no shards | held-out rows {len(eval_rows or [])}")
+    else:
+        it = iter(ShardStream(cfg["shard_dir"], consume=cfg.get("consume", False),
+                              start_sample=cfg.get("start_sample", 0),
+                              producer_log=cfg.get("producer_log"),
+                              timeout_s=cfg.get("stream_timeout", 600)))
     opt = adamw(model.parameters(), cfg)
     steps = smoke or cfg["steps"]
     ckpt_dir = os.path.join(out_dir, "ckpt")
@@ -262,10 +282,16 @@ def run(cfg, smoke=None):
     use_bf16 = dev == "cuda"
     fwd = prepare(model, cfg, sched, bs, dev)
 
-    it = iter(stream)
     t0, toks = time.time(), 0
+
+    # Every timestamp below is taken with the GPU idle: without the sync, t_fwd/t_bwd would measure
+    # kernel launch, and a feed-bound run would report a fake ~99% "gpu" share. Six syncs a step is
+    # noise next to a 0.5-2 s step.
+    _sync = torch.cuda.synchronize if dev == "cuda" else (lambda: None)
     pbar = tqdm(range(steps), desc="train", unit="step", disable=not sys.stderr.isatty())
     for step in pbar:
+        _sync()
+        _t0 = time.time()
         rows = []
         while len(rows) < bs:
             try:
@@ -274,18 +300,28 @@ def run(cfg, smoke=None):
                 print("stream ended before the step budget: stopping")
                 steps = step
                 break
+        _sync()
+        _t1 = time.time()
         if len(rows) < bs:
             break
         batch = to_device(collate(rows, sched), dev)
+        _sync()
+        _t2 = time.time()
         for g in opt.param_groups:
             g["lr"] = lr_at(step, {**cfg, "steps": steps})
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
             logits = fwd(batch)
             loss = omni_loss(logits, batch, sched, label_smoothing=cfg.get("label_smoothing", 0.0))
+        _sync()
+        _t3 = time.time()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("clip", 1.0))
+        _sync()
+        _t4 = time.time()
         opt.step()
+        _sync()
+        _t5 = time.time()
         toks += bs * T
         el = time.time() - t0
         rec = dict(step=step, loss=float(loss.detach()), grad_norm=float(gn.detach()),
@@ -293,21 +329,43 @@ def run(cfg, smoke=None):
                    samples_per_s=round(toks / T / el, 2),   # toks/T is samples, not steps
                    steps_per_s=round((step + 1) / el, 2),
                    pos_per_s=round(toks / el, 1),
-                   tflops=round(step_flops(Pf, bs, T) * (step + 1) / el / 1e12, 2))
-        if writer is not None and (step % max(1, cfg.get("log_every", 10)) == 0
-                                   or step == steps - 1):
+                   tflops=round(step_flops(Pf, bs, T) * (step + 1) / el / 1e12, 2),
+                   # Per-step stage split. With a feed near 2 samples/s and 462M active params the
+                   # question is never "how fast" but "waiting on rows or waiting on the GPU", and
+                   # data_pct answers it without arithmetic on the reader's side.
+                   samples=toks // T,        # what the stream actually delivered, not the plan
+                   t_fetch=round(_t1 - _t0, 3), t_prep=round(_t2 - _t1, 3),
+                   t_fwd=round(_t3 - _t2, 3), t_bwd=round(_t4 - _t3, 3),
+                   t_opt=round(_t5 - _t4, 3),
+                   data_pct=round(100 * (_t2 - _t0) / max(1e-9, _t5 - _t0), 1),
+                   gpu_pct=round(100 * (_t5 - _t2) / max(1e-9, _t5 - _t0), 1))
+        logging = step % max(1, cfg.get("log_every", 10)) == 0 or step == steps - 1
+        if logging:
+            # One loss-stats pass per logged step, computed whether or not TensorBoard is up:
+            # metrics.jsonl has to carry the per-(modality, level) CE, because the notebook's
+            # learning check reads plain JSON. Until now that breakdown existed only as tb event
+            # files, so the only way to see "is the audio expert learning" was to install diskwriter.
             with torch.no_grad():
                 _, st = omni_loss_stats(logits, batch, sched)
-            writer.add_scalar("train/loss", float(loss.detach()), step)
-            writer.add_scalar("train/grad_norm", float(gn), step)
-            writer.add_scalar("train/lr", rec["lr"], step)
-            writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
-            writer.add_scalar("perf/tflops", rec["tflops"], step)
-            for (mm, kk), v in st.items():
-                writer.add_scalar(f"train/ce/{mm}_L{kk}", v["ce"], step)
+            rec["ce"] = {f"{mm}_L{kk}": round(float(v["ce"]), 4)
+                         for (mm, kk), v in st.items()}
+            if writer is not None:
+                writer.add_scalar("train/loss", float(loss.detach()), step)
+                writer.add_scalar("train/grad_norm", float(gn), step)
+                writer.add_scalar("train/lr", rec["lr"], step)
+                writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
+                writer.add_scalar("perf/tflops", rec["tflops"], step)
+                writer.add_scalar("trace/data_pct", rec["data_pct"], step)
+                writer.add_scalar("trace/gpu_pct", rec["gpu_pct"], step)
+                writer.add_scalar("trace/t_fetch", rec["t_fetch"], step)
+                writer.add_scalar("trace/t_prep", rec["t_prep"], step)
+                writer.add_scalar("trace/t_fwd", rec["t_fwd"], step)
+                writer.add_scalar("trace/t_bwd", rec["t_bwd"], step)
+                for (mm, kk), v in st.items():
+                    writer.add_scalar(f"train/ce/{mm}_L{kk}", v["ce"], step)
         pbar.set_postfix(loss=f"{rec['loss']:.4f}", pos_s=rec["pos_per_s"],
-                         tflops=rec["tflops"])
-        if step % cfg.get("log_every", 10) == 0 or step == steps - 1:
+                         tflops=rec["tflops"], data=f"{rec['data_pct']:.0f}%")
+        if logging:
             metrics.write(json.dumps(rec) + "\n")
             metrics.flush()
             pbar.write(json.dumps(rec))

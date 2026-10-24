@@ -11,6 +11,7 @@ Both arms use the same schedule, vocab and model width; the only difference is t
 mask (`block` vs `ar`), which is what makes the comparison a matched-params comparison.
 """
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -24,12 +25,15 @@ RUN = os.path.join(HERE, "run")
 # Model/optimiser presets. Parameter counts are measured, not nominal: at base_len=1024 the
 # positional table is 1025 x d, so the same width counts for more than it does at 64.
 #   sm  10.44M  d384  L6  h6  kv2     -> the debug harness that produced the 10M result
-#   md  84.6M   d768  L13 h12 kv3     -> the kill test rung
+#   md  83.6M   d768  L13 h12 kv3     -> the kill test rung (measured 83.59M at base_len 1024)
 #   lg  454.1M  d1536 L18 h16 kv4     -> the paper number, rented H100 only
+#   moex 1.178B total / 459M active   d1536 L16 h16 kv4, 3 experts x 359.8M -> needs
+#                                      --moe 3 --moe-ffn 4880, or it is just another lg
 PRESETS = {
     "sm": dict(n_embd=384,  n_layer=6,  n_head=6,  n_kv_head=2, batch=8,  lr=3e-4,   warmup=100),
     "md": dict(n_embd=768,  n_layer=13, n_head=12, n_kv_head=3, batch=8,  lr=2e-4,   warmup=200),
-    "lg": dict(n_embd=1536, n_layer=18, n_head=16, n_kv_head=4, batch=8,  lr=1.5e-4, warmup=300),
+    "lg": dict(n_embd=1536, n_layer=18, n_head=16, n_kv_head=4, batch=8, lr=1.5e-4, warmup=300),
+    "moex": dict(n_embd=1536, n_layer=16, n_head=16, n_kv_head=4, batch=8, lr=1.5e-4, warmup=300),
 }
 
 
@@ -63,6 +67,9 @@ def apply_overrides(cfg, a):
     if moe:
         cfg["model"]["n_experts"] = int(moe)
         cfg["model"]["expert_map"] = {"text": 0, "image": 1, "audio": 2}
+        mff = getattr(a, "moe_ffn", 0)
+        if mff:
+            cfg["model"]["moe_ffn"] = int(mff)
     hv = getattr(a, "hetero_vocab", 0)
     if hv:
         K = cfg["sched"]["K"]
@@ -107,19 +114,44 @@ def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
         produce=dict(out_dir=out, sample_budget=budget, shard_samples=64,
                      max_ahead_shards=24, shuffle_buf=512, batch_docs=8, seed=3407,
                      holdout=dict(text=32, image=24, audio=16),
-                     # 60 / 20 / 20 text / vision / audio. Text no longer has a video slice to
-                     # give away, and audio was tripled: it is the modality whose finest level was
-                     # starved at 8% of the mix.
-                     mix=dict(text_fineweb=0.12, text_cosmopedia=0.07, text_wikipedia=0.04,
-                              text_math_web=0.07, text_math_fine=0.06, text_math_numina=0.05,
-                              text_arxiv=0.06, text_code=0.09, text_code_inst=0.04,
-                              image_docvqa=0.05, image_imagenet=0.05, image_coco=0.04,
-                              image_wikiart=0.03, image_flowers=0.02, image_food=0.01,
-                              audio_libri=0.075, audio_libritts=0.05, audio_fleurs=0.05,
-                              audio_peoples=0.025),
+                     # 41.7 / 41.7 / 16.7 of SAMPLES, which is equal LIVE CODES per modality at the
+                     # 50x / 50x / 30x token targets: text and image contribute 2016 packed positions
+                     # each, audio 3024, so equal shares would not be equal codes. At the old 60/20/20
+                     # the image expert was the binding constraint and the whole run had to be 1.83x
+                     # larger to give it its tokens.
+                     mix=dict(text_fineweb=0.0832, text_cosmopedia=0.0486, text_wikipedia=0.0278,
+                              text_math_web=0.0486, text_math_fine=0.0417, text_math_numina=0.0347,
+                              text_arxiv=0.0417, text_code=0.0625, text_code_inst=0.0278,
+                              image_docvqa=0.1042, image_imagenet=0.1042, image_coco=0.0833,
+                              image_wikiart=0.0625, image_flowers=0.0417, image_food=0.0208,
+                              audio_libri=0.0625, audio_libritts=0.0417, audio_fleurs=0.0417,
+                              audio_peoples=0.0208),
                      codebook_size=256, prefer_real=True,
                      K=None, R=None, base_len=None),
     )
+
+
+def train_cfg(cfg, mode="strict", out_dir=None, steps=None):
+    """The flat config one trainer reads: what write_cfgs puts on disk, built in memory.
+
+    write_cfgs and the notebook both go through this, so a direct-feed run differs from a shard
+    run in the data source and nothing else.
+    """
+    prod = cfg["produce"]
+    t = dict(cfg["train"])
+    if steps:
+        t["steps"] = int(steps)
+    t.update(sched=cfg["sched"], vocab=cfg["vocab"],
+             model=dict(cfg["model"], mask_mode=mode),
+             out_dir=out_dir or os.path.join(RUN, "train_" + mode),
+             shard_dir=prod["out_dir"],
+             producer_log=os.path.join(RUN, "producer.log"),
+             eval_files={g: os.path.join(prod["out_dir"], f"eval_{g}.npz")
+                         for g in prod["holdout"]},
+             consume=False,
+             stream_timeout=1800,
+             preflight=cfg.get("preflight") or {})
+    return t
 
 
 def write_cfgs(cfg, budget=None, steps=None):
@@ -145,24 +177,9 @@ def write_cfgs(cfg, budget=None, steps=None):
 
     for arm, mode in (("train_block", "block"), ("train_ar", "ar"),
                       ("train_strict", "strict")):
-        t = dict(cfg["train"])
-        if steps:
-            t["steps"] = int(steps)
-        t.update(sched=sch, vocab=cfg["vocab"],
-                 model=dict(cfg["model"], mask_mode=mode),
-                 out_dir=os.path.join(RUN, arm),
-                 shard_dir=prod["out_dir"],
-                 producer_log=os.path.join(RUN, "producer.log"),
-                 eval_files={g: os.path.join(prod["out_dir"], f"eval_{g}.npz")
-                             for g in prod["holdout"]},
-                 consume=False,          # both arms read the same shards
-                 stream_timeout=1800,
-                 # without this the child never sees the preflight section, so --no-preflight,
-                 # --preflight-steps and --preflight-lr were silently dropped on the shard path
-                 preflight=cfg.get("preflight") or {})
+        t = train_cfg(cfg, mode, os.path.join(RUN, arm), steps)
         json.dump(t, open(paths[arm], "w"), indent=2)
 
-    import glob
     json.dump(dict(block_ckpt=os.path.join(RUN, "train_block", "final.pt"),
                    ar_ckpt=os.path.join(RUN, "train_ar", "final.pt"),
                    strict_ckpt=os.path.join(RUN, "train_strict", "final.pt"),
@@ -416,8 +433,8 @@ def cmd_all(args):
     return rc
 
 
-def main(argv=None):
-    """argv=None keeps the CLI; a notebook passes a list and never leaves the kernel."""
+def build_parser():
+    """The CLI, exposed so a notebook can build the same cfg in-process: no cfg json on disk."""
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["check", "produce", "train", "eval", "all", "cfg"])
     ap.add_argument("--budget", type=int, default=None)
@@ -450,6 +467,9 @@ def main(argv=None):
                     help="producer processes; each reads index i mod N of every stream")
     ap.add_argument("--moe", type=int, default=0,
                     help="n_experts (1 per modality). 0 = dense trunk, the old layout")
+    ap.add_argument("--moe-ffn", type=int, default=0, dest="moe_ffn",
+                    help="expert SwiGLU width h. 0 = mlp_ratio 4.0 (2048 at d=768). 4880 gives "
+                         "359.8M per expert at d=1536/L=16, i.e. the 360M rung")
     ap.add_argument("--hetero-vocab", type=int, default=0, dest="hetero_vocab",
                     help="finest-level text vocab, e.g. 8000 or 32000; 0 = one codebook per level")
     ap.add_argument("--preflight-lr", type=float, default=None, dest="preflight_lr",
@@ -478,7 +498,12 @@ def main(argv=None):
                     help="producer rolling-buffer cap in shards; 0 keeps the default 24, "
                          "which blocks forever when nothing deletes shards (batch runs: 100000)")
     ap.add_argument("--wait-timeout", type=int, default=3600)
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    """argv=None keeps the CLI; a notebook passes a list and never leaves the kernel."""
+    a = build_parser().parse_args(argv)
     if a.cmd == "cfg":
         write_cfgs(apply_overrides(default_cfg(), a), a.budget)
         return 0

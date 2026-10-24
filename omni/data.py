@@ -113,6 +113,24 @@ class ShardStream(IterableDataset):
             time.sleep(self.poll)
 
 
+class RowsSet(Dataset):
+    """Held-out rows held in memory.
+
+    Same interface as EvalSet but with no npz behind it: the direct feed peeks N rows before
+    training starts and validates on those, so the val curve is stable within a run without
+    anything touching the disk.
+    """
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        return self.rows[i]
+
+
 class EvalSet(Dataset):
     def __init__(self, npz_path):
         z, self.meta = read_npz(npz_path)

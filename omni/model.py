@@ -77,7 +77,7 @@ class OmniConfig:
     def __init__(self, sched: OmniSchedule, vocab: Dict[str, int], n_embd=384, n_layer=6,
                  n_head=6, n_kv_head=2, dropout=0.0, qk_norm=True,
                  cond_mode="gt_embed", mask_mode="block", max_pos=None,
-                 n_experts=0, expert_map=None):
+                 n_experts=0, expert_map=None, moe_ffn=0, use_flex=None):
         self.sched = sched
         self.vocab_raw = vocab
         self.vocab = normalize_vocab(vocab, sched.modalities, sched.K)
@@ -87,6 +87,14 @@ class OmniConfig:
         self.cond_mode, self.mask_mode = cond_mode, mask_mode
         self.n_experts = int(n_experts or 0)
         self.expert_map = expert_map
+        self.moe_ffn = int(moe_ffn or 0)          # 0 = derive the expert width from mlp_ratio
+        # None = auto (flex on sm_80+), False = force the dense SDPA mask. Measured on an A100 at
+        # T=1764, B=8, H=16: dense materialises [B,H,T,T] = 1.59 GiB per tensor and its backward
+        # keeps several, so it OOMs while asking for 1.48 GiB with 33.6 GiB already resident - and
+        # it runs at 28 TFLOPS against 99 for the block-sparse path. Flex's Triton kernel failing to
+        # compile (182 KB of shared memory wanted, 166 KB available) is still the better trade: the
+        # unfused fallback is fast. Leave this None unless the packed length is small.
+        self.use_flex = use_flex
         self.max_pos = max_pos or max(sched.base_len[m] for m in sched.modalities)
 
     # -- vocab -------------------------------------------------------------
@@ -116,8 +124,7 @@ def level_ids_for(sched: OmniSchedule, T: int, device="cpu"):
     return lev[:T].to(device), mod[:T].to(device), pos[:T].to(device)
 
 
-_CACHE_MAX = 8                   # entries for the two caches below
-_MASK_CACHE_BYTES = 64 << 20     # a T=7119 fp32 mask is 202 MB: rebuild it rather than pin it
+_CACHE_MAX = 8                   # entries for _STATIC below
 
 
 def _geometry(sched: OmniSchedule):
@@ -130,7 +137,6 @@ def _geometry(sched: OmniSchedule):
 
 
 _STATIC = {}                     # (geometry, T, device, head_dim, emap) -> lev, mod, pos, rope, eid
-_MASK_CACHE = OrderedDict()      # dense additive masks: pure functions of (schedule, T, mode)
 
 
 def static_tensors(sched: OmniSchedule, T: int, device, head_dim: int, emap=None):
@@ -165,17 +171,13 @@ def static_tensors(sched: OmniSchedule, T: int, device, head_dim: int, emap=None
 
 def trunc_mask(sched: OmniSchedule, T: int, dtype=torch.float32, device="cpu",
                cross_level=False, mask_mode="block"):
-    """Additive [1,1,T,T] mask, cached per (T, dtype, device, mask mode).
+    """Additive [1,1,T,T] mask for a packed length T.
 
-    Cached because it is a pure function of the schedule and T, and it used to be allocated and
-    filled from scratch every step: a T x T zero tensor, a masked_fill_ and a view, i.e. ~400 KB
-    of allocator churn plus two kernels whose result cannot change between steps.
+    Deliberately not cached. It was, keyed on (geometry, T, dtype, device, cross_level, mode), and
+    the cache had to refuse anything over 64 MB - i.e. it silently rebuilt every step at any
+    T above ~4000, which is exactly the range we care about. So it bought nothing where it
+    mattered and was a second place for the mask to be wrong. Build it; it is pure.
     """
-    key = (_geometry(sched), int(T), str(dtype), str(device), bool(cross_level), mask_mode)
-    hit = _MASK_CACHE.get(key)
-    if hit is not None:
-        _MASK_CACHE.move_to_end(key)
-        return hit
     lev, _, _ = level_ids_for(sched, T, device)
     q, kv = lev[:, None], lev[None, :]
     if mask_mode == "ar":
@@ -194,12 +196,7 @@ def trunc_mask(sched: OmniSchedule, T: int, dtype=torch.float32, device="cpu",
             allowed = allowed | ((q >= 0) & (kv >= 0) & (kv < q))
     m = torch.zeros(T, T, dtype=dtype, device=device)
     m.masked_fill_(~allowed, float("-inf"))
-    m = m.view(1, 1, T, T)
-    if T * T * m.element_size() <= _MASK_CACHE_BYTES:
-        _MASK_CACHE[key] = m
-        while len(_MASK_CACHE) > _CACHE_MAX:
-            _MASK_CACHE.popitem(last=False)
-    return m
+    return m.view(1, 1, T, T)
 
 
 def kv_ids(lev):                                            # kept for clarity in trunc_mask
@@ -268,7 +265,8 @@ class OmniNCM(nn.Module):
             self._emap, self.n_experts = resolve_expert_map(
                 cfg.sched.modalities, cfg.expert_map, cfg.n_experts)
             blocks = [MoEBlock(Block(d, cfg.n_head, cfg.n_kv_head, cfg.dropout, qk_norm=cfg.qk_norm),
-                               d, self.n_experts) for _ in range(cfg.n_layer)]
+                               d, self.n_experts, ffn_hidden=cfg.moe_ffn or None)
+                      for _ in range(cfg.n_layer)]
         else:
             self._emap, self.n_experts = None, 0
             blocks = [Block(d, cfg.n_head, cfg.n_kv_head, cfg.dropout, qk_norm=cfg.qk_norm)
@@ -360,9 +358,26 @@ class OmniNCM(nn.Module):
         return self.pos_emb.weight.device
 
     # ------------------------------------------------------------------ forward
+    def _expert_ids(self, mod_idx):
+        """Packed-position modality index -> expert id under this model's expert map.
+
+        preflight calls this to count the tokens each expert would receive, so a forced mapping that
+        leaves an expert with nothing shows up before training instead of being inferred from a flat
+        loss curve. It was referenced from omni/preflight.py long before it existed here: the MoE
+        branch of preflight had never run, so nothing caught the missing method.
+        """
+        if self._emap is None:
+            raise ValueError("dense model has no experts; _expert_ids needs an expert_map")
+        eid = torch.zeros_like(mod_idx)
+        for i, ex in enumerate(self._emap):        # prefix slots keep expert 0, as in static_tensors
+            eid[mod_idx == i] = ex
+        return eid
+
     def encode(self, x, mask_mode=None, cross_level=False, use_flex=None):
         T, B = x.size(1), x.size(0)
         mask_mode = mask_mode or self.cfg.mask_mode
+        if use_flex is None:
+            use_flex = self.cfg.use_flex      # config override; False forces the dense SDPA mask
         if use_flex is None:
             # flex_attention's fused kernel needs sm_80+. On a free T4 (sm_75) it either errors or
             # falls back to something slower than the dense SDPA path, so gate on capability.
@@ -519,7 +534,7 @@ def omni_loss_stats(logits, batch, sched: OmniSchedule, label_smoothing=0.0):
             loss_k = F.cross_entropy(flat_lg, flat_tg, reduction="sum", ignore_index=-100,
                                      label_smoothing=label_smoothing)
             cnt = int(flat_keep.sum())
-            out[(m, k)] = {"ce": float(loss_k) / max(1, cnt), "n": cnt}
+            out[(m, k)] = {"ce": float(loss_k.detach()) / max(1, cnt), "n": cnt}
             total = loss_k if total is None else total + loss_k
             n += cnt
     mean = (total / max(1, n)) if total is not None else torch.zeros((), device=self_dev(codes))
@@ -549,6 +564,22 @@ def selfcheck(verbose=True):
     for m in MODALITIES:
         for k in range(sched.K):
             assert out[(m, k)].shape == (B, sched.level_len(m, k), vocab[m]), (m, k, out[(m, k)].shape)
+
+    # 1b. expert width. `moe_ffn` has to mean what it says: the mlp_ratio path rounds through
+    # int(2*r*d/3//8*8), so "360M per expert" comes out a slightly different number, and the whole
+    # 50x token budget is derived from this count. Asserted, not trusted.
+    wcfg = OmniConfig(sched, vocab, n_embd=32, n_layer=2, n_head=4, n_kv_head=2,
+                      n_experts=3, moe_ffn=128)
+    wnet = OmniNCM(wcfg)
+    e0 = wnet.blocks[0].experts
+    per_layer = sum(w.numel() for w in (e0.w_gate[0].weight, e0.w_up[0].weight,
+                                        e0.w_down[0].weight))
+    assert per_layer == 3 * wcfg.n_embd * 128, {
+        "h": e0.w_gate[0].weight.shape[0], "per_layer": per_layer, "want": 3 * wcfg.n_embd * 128}
+    assert e0.w_gate[0].weight.shape[0] == 128, "ffn_hidden not applied to the gate"
+    got = sum(p.numel() for n, p in wnet.named_parameters() if ".experts.w_" in n)
+    want = wcfg.n_layer * 3 * (3 * wcfg.n_embd * 128 + 2 * 128 + wcfg.n_embd)  # + gate/up/down bias
+    assert got == want, f"expert total: {got} != {want}"
 
     # 2. level k cannot see level k+1: perturb the finest level, the coarsest logits must not move
     net.eval()

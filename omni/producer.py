@@ -252,7 +252,8 @@ SOURCES = {
     "audio_libritts":   (_raw("mythicinfinity/libritts_r", "clean", "train.clean.100",
                               column="audio"), _audio_text),
     "audio_fleurs":     (_raw("google/fleurs", "en_us", column="audio"), _audio_text),
-    "audio_peoples":    (_raw("MLCommons/peoples_speech", "microset", column="audio"),
+    # "clean", not "microset": the 30x audio budget needs ~31k hours, microset is a demo slice.
+    "audio_peoples":    (_raw("MLCommons/peoples_speech", "clean", column="audio"),
                          _audio_text),
     # --- video (data path only; kinetics-mini streams, ucf101-subset is 2 clips)
     "video_ucf":        (_raw(["nateraw/kinetics-mini", "sayakpaul/ucf101-subset"],
@@ -292,8 +293,13 @@ class Source:
                 ds = ds.shard(num_shards=self.shard[1], index=self.shard[0], contiguous=False)
                 self.sharded = True
             except Exception as e:                             # noqa: BLE001
+                # Not a defect: `batch()` row-strides unsharded sources by `self.n % N`, so the rows
+                # stay correct. The cost is bandwidth - every worker reads the whole stream - which is
+                # exactly what the docstring above warns about. Striding again here would compound it
+                # into 1/N^2 and silently starve the source.
                 log(f"[source] {self.name}: backend shard unavailable "
-                    f"({type(e).__name__}: {str(e)[:60]}) - index fallback, full stream per worker")
+                    f"({type(e).__name__}: {str(e)[:60]}) - full stream per worker, "
+                    f"row stride in batch() (N x bandwidth, correct rows)")
         return iter(ds)
 
     def reopen(self, err):
@@ -489,7 +495,10 @@ def run(cfg, selfcheck=False):
     log("sources:", {n: round(frac[n], 3) for n in live})
     needed = {GROUPS[n] for n in live}        # only groups with a live source gate EVAL_READY
 
-    rng = random.Random(cfg["seed"])
+    # Per-worker seed. One shared seed made every worker walk the sources in the same order with
+    # the same weights, so N workers piled onto the same heavy source at the same instant - the
+    # thundering herd that makes a 4-worker run hungrier and no faster than a 1-worker run.
+    rng = random.Random(int(cfg["seed"]) + 7919 * worker)
     used = {n: 0 for n in live}
     dropped = {n: 0 for n in live}
     held = {g: [] for g in holdout}
@@ -545,10 +554,14 @@ def run(cfg, selfcheck=False):
         cur.append(out_row)
 
     active = list(live)
+    st = dict(pull=0.0, enc=0.0, write=0.0)        # wall clock per stage, flushed into progress
+
     while active and seen_so_far[0] < budget:
         name = rng.choices(active, weights=[frac[n] for n in active])[0]
         group = GROUPS[name]
+        _t = time.perf_counter()
         batch = live[name].batch(cfg["batch_docs"])
+        st["pull"] += time.perf_counter() - _t
         if not batch:
             active.remove(name)
             log(f"[source] {name} exhausted/dead")
@@ -557,22 +570,39 @@ def run(cfg, selfcheck=False):
             if seen_so_far[0] >= budget:
                 break
             used[name] += 1
+            _t = time.perf_counter()
             codes, present = encode_sample(codecs, sched, parts)
+            st["enc"] += time.perf_counter() - _t
             if not any(present.values()):
                 dropped[name] += 1
                 continue
             emit({"codes": codes, "present": present}, group)
+        _t = time.perf_counter()
         flush()
+        st["write"] += time.perf_counter() - _t
+        el = max(1e-9, time.time() - t0)
+        tot = max(1e-9, sum(st.values()))
         json.dump({"samples": seen_so_far[0], "budget": budget, "shards": written,
-                   "per_source": used, "eval_held": {g: len(v) for g, v in held.items()},
-                   "elapsed_min": round((time.time() - t0) / 60, 2),
-                   "samples_per_s": round(seen_so_far[0] / max(1e-9, time.time() - t0), 1)},
+                   "per_source": used,
+                   # rows/s per source: a source that is alive but starving shows up here without
+                   # anyone having to diff two progress files by hand.
+                   "per_source_s": {n: round(v / el, 3) for n, v in used.items() if v},
+                   "dropped": {n: v for n, v in dropped.items() if v},
+                   "eval_held": {g: len(v) for g, v in held.items()},
+                   "elapsed_min": round(el / 60, 2),
+                   "samples_per_s": round(seen_so_far[0] / el, 3),
+                   # Where the wall clock went: pull = blocked on the Hub, enc = decode + codec,
+                   # write = npz. A produce run that looks stuck is almost always pull.
+                   "stage_pct": {k: round(100 * v / tot, 1) for k, v in st.items()},
+                   "stage_s": {k: round(v, 1) for k, v in st.items()}},
                   open(os.path.join(out, "progress.json" if nworkers == 1
                                     else f"progress_w{worker}.json"), "w"))
         if seen_so_far[0] % 25 == 0:
             raw = {n: live[n].n for n in live}
             log(f"progress {seen_so_far[0]}/{budget} samples | {written} shards | "
-                f"{seen_so_far[0] / max(1e-9, time.time() - t0):.2f} samples/s | "
+                f"{seen_so_far[0] / el:.2f} samples/s | "
+                f"pull {100 * st['pull'] / tot:.0f}% enc {100 * st['enc'] / tot:.0f}% "
+                f"write {100 * st['write'] / tot:.0f}% | dropped {sum(dropped.values())} | "
                 f"pulled {sum(raw.values())} rows | sharded="
                 f"{sum(1 for n in live if live[n].sharded)}/{len(live)}")
 

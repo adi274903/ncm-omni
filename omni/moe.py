@@ -37,9 +37,12 @@ def resolve_expert_map(modalities, mapping=None, n_experts=None):
 class ModalityExperts(nn.Module):
     """n_experts independent SwiGLU FFNs; every token goes to exactly one of them."""
 
-    def __init__(self, n_embd, n_experts, mlp_ratio=4.0):
+    def __init__(self, n_embd, n_experts, mlp_ratio=4.0, ffn_hidden=None):
         super().__init__()
-        h = int(2 * mlp_ratio * n_embd / 3 // 8 * 8)          # same width as core.Block
+        # `ffn_hidden` pins the SwiGLU width directly. mlp_ratio alone is a lossy way to ask for it:
+        # int(2*r*d/3//8*8) rounds, so at a target like 360M per expert the ratio stops meaning what
+        # it says, and a 4.8 ratio at d=1536 is a number nobody can read back.
+        h = int(ffn_hidden) // 8 * 8 if ffn_hidden else int(2 * mlp_ratio * n_embd / 3 // 8 * 8)
         self.n_experts = n_experts
         self.w_gate = nn.ModuleList([nn.Linear(n_embd, h) for _ in range(n_experts)])
         self.w_up = nn.ModuleList([nn.Linear(n_embd, h) for _ in range(n_experts)])
@@ -85,13 +88,13 @@ class MoEBlock(nn.Module):
     kept (ln1, ln2, attn), so state_dict keys stay blocks.<i>.attn... as before.
     """
 
-    def __init__(self, base, n_embd, n_experts, mlp_ratio=4.0):
+    def __init__(self, base, n_embd, n_experts, mlp_ratio=4.0, ffn_hidden=None):
         super().__init__()
         self.ln1, self.ln2, self.attn = base.ln1, base.ln2, base.attn
         for name in ("w_gate", "w_up", "w_down"):
             if hasattr(base, name):
                 delattr(base, name)                        # frees the dense FFN, not just ignores it
-        self.experts = ModalityExperts(n_embd, n_experts, mlp_ratio)
+        self.experts = ModalityExperts(n_embd, n_experts, mlp_ratio, ffn_hidden=ffn_hidden)
 
     def forward(self, x, block_mask=None, dense_mask=None, rope=None, mod_id=None, plan=None):
         x = x + self.attn(self.ln1(x), block_mask=block_mask, dense_mask=dense_mask, rope=rope)
