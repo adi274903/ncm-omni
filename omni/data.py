@@ -56,7 +56,7 @@ class ShardStream(IterableDataset):
             return "".join(f.readlines()[-n:])
 
     def __iter__(self):
-        seen, t0, i = 0, time.time(), 0
+        seen, t0, i, last_say = 0, time.time(), 0, 0.0
         while True:
             files = self._shards()
             if files:
@@ -88,6 +88,17 @@ class ShardStream(IterableDataset):
                 return                                   # producer finished and nothing is left
             if self.timeout_s and time.time() - t0 > self.timeout_s:
                 raise TimeoutError(f"no shards after {self.timeout_s}s\n{self._tail()}")
+            # Silence here is indistinguishable from a hang: the loop can legitimately wait the
+            # whole stream_timeout (1800s) for a producer that is still filling its shuffle
+            # buffer. Say so every 15s, with the producer's last log line if we have one.
+            if time.time() - last_say > 15:
+                last_say = time.time()
+                have = (f"{len(os.listdir(self.dir))} files" if os.path.isdir(self.dir)
+                        else f"{self.dir} does not exist")
+                tail = self._tail().strip().splitlines()[-1:] if self.producer_log else []
+                print(f"  waiting for shards: {have}, {time.time() - t0:.0f}s of "
+                      f"{self.timeout_s or '-'}s{' | ' + tail[0][:120] if tail else ''}",
+                      flush=True)
             time.sleep(self.poll)
 
 
