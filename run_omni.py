@@ -69,6 +69,9 @@ def apply_overrides(cfg, a):
         v = dict(cfg["vocab"])
         v["text"] = [int(cfg["vocab"]["text"])] * (K - 1) + [int(hv)]
         cfg["vocab"] = v
+    sb = getattr(a, "shuffle_buf", 0)
+    if sb:
+        cfg["produce"]["shuffle_buf"] = int(sb)
     ev = getattr(a, "eval_every", None)
     if ev:
         cfg["train"]["eval_every"] = int(ev)
@@ -272,12 +275,27 @@ def cmd_produce(args):
         print("background; training can start once EVAL_READY exists")
         return 0
 
+    # emit() fills a shuffle buffer before feeding the writer, so the first shard cannot exist
+    # until shuffle_buf + shard_samples samples have been pulled PER WORKER. Reporting only the
+    # shard count makes that interval indistinguishable from a hang.
+    first_at = int(base.get("shuffle_buf", 512)) + int(base.get("shard_samples", 64))
+    print(f"  first shard needs ~{first_at} samples/worker ({first_at * nworkers:,} total, "
+          f"shuffle_buf + shard_samples): 0 shards before that is normal", flush=True)
     t0, codes = time.time(), []
     try:
         while any(p.poll() is None for p in procs):
             time.sleep(10)
             done = _nshards(stream_dir)
-            print(f"  {done} shards on disk | {time.time() - t0:.0f}s", flush=True)
+            got = 0
+            for i in range(nworkers):                 # the worker's own counter, not the file count
+                try:
+                    got += int(json.load(open(os.path.join(stream_dir, f"progress_w{i}.json")))[
+                        "samples"])
+                except Exception:                     # noqa: BLE001 - not written yet
+                    pass
+            el = max(1e-9, time.time() - t0)
+            print(f"  {done} shards | {got:,}/{total:,} samples | "
+                  f"{got / el:.1f}/s | {time.time() - t0:.0f}s", flush=True)
     except KeyboardInterrupt:
         for p in procs:
             p.terminate()
@@ -413,6 +431,9 @@ def main(argv=None):
     ap.add_argument("--save-every", type=int, default=None, dest="save_every",
                     help="checkpoint interval; the live-stream path has no replay, so this is "
                          "the only way to survive a Colab session limit")
+    ap.add_argument("--shuffle-buf", type=int, default=0, dest="shuffle_buf",
+                    help="rows buffered per worker before the first shard can be written "
+                         "(default 512; lower it for smoke corpora)")
     ap.add_argument("--eval-every", type=int, default=None, dest="eval_every",
                     help="validation loss every N steps on the held-out shards (default 1000)")
     ap.add_argument("--arms", default=None,
