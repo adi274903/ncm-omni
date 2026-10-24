@@ -91,6 +91,17 @@ class ShardStream(IterableDataset):
             # Silence here is indistinguishable from a hang: the loop can legitimately wait the
             # whole stream_timeout (1800s) for a producer that is still filling its shuffle
             # buffer. Say so every 15s, with the producer's last log line if we have one.
+            # Nobody is producing: an empty dir with no producer log to tail means this is not a
+            # slow start, it is a mis-sequenced run. 20s is enough to tell the difference, and far
+            # better than blocking out the full stream_timeout.
+            busy = (os.path.isdir(self.dir) and bool(os.listdir(self.dir))) or (
+                self.producer_log and os.path.exists(self.producer_log))
+            if not files and time.time() - t0 > 20 and not busy:
+                raise RuntimeError(
+                    f"no shards in {self.dir} and no producer is writing there "
+                    f"({self.producer_log or 'no producer_log'} missing).\n"
+                    f"run_omni.py produce must finish first:  run_omni.py produce --budget 2000 "
+                    f"--shuffle-buf 128 --workers 4 --foreground")
             if time.time() - last_say > 15:
                 last_say = time.time()
                 have = (f"{len(os.listdir(self.dir))} files" if os.path.isdir(self.dir)
