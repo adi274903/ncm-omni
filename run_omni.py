@@ -75,6 +75,9 @@ def apply_overrides(cfg, a):
     ev = getattr(a, "eval_every", None)
     if ev:
         cfg["train"]["eval_every"] = int(ev)
+    pflr = getattr(a, "preflight_lr", None)
+    if pflr is not None:
+        cfg.setdefault("preflight", {})["lr"] = float(pflr)
     pfs = getattr(a, "preflight_steps", None)
     if pfs is not None:
         cfg.setdefault("preflight", {})["steps"] = int(pfs)
@@ -446,6 +449,9 @@ def main(argv=None):
                     help="n_experts (1 per modality). 0 = dense trunk, the old layout")
     ap.add_argument("--hetero-vocab", type=int, default=0, dest="hetero_vocab",
                     help="finest-level text vocab, e.g. 8000 or 32000; 0 = one codebook per level")
+    ap.add_argument("--preflight-lr", type=float, default=None, dest="preflight_lr",
+                    help="preflight learning rate. Default 2x the preset's train lr, clamped to "
+                         "[3e-4, 3e-3] - a fixed 3e-3 is 15x too hot for md")
     ap.add_argument("--preflight-steps", type=int, default=None, dest="preflight_steps",
                     help="test C steps that run before training (default 300)")
     ap.add_argument("--no-preflight", action="store_true", dest="no_preflight",

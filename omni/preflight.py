@@ -97,7 +97,15 @@ def run_preflight(cfg, writer=None, steps=None, batch=None, device=None, verbose
     # A deliberately hotter LR than the main run: this is a wiring test, not a quality test, and
     # the copy relation is learnable in a few hundred steps at 3e-3. Gating on the real run's LR
     # would turn a slow warmup into a false "the head is broken".
-    opt = torch.optim.AdamW(model.parameters(), lr=float(pf.get("lr", 3e-3)),
+    # Hotter than the real run on purpose: this is a wiring test, not a quality run, and gating on
+    # the warmup LR turns a slow start into a false "the head is broken". But it must stay in the
+    # same regime as the model it is testing: 3e-3 was tuned on a 3.25M (d128) model and applied
+    # unchanged to d768 here, which is 15x the preset's own 2e-4. That produced a sawtooth
+    # (4.4 -> 3.2 -> 2.9 -> 3.3 -> 1.98) and mid levels pinned at ~3.2. Scale with width instead.
+    base_lr = float((cfg.get("train") or {}).get("lr", 2e-4))
+    lr = float(pf.get("lr") or min(3e-3, max(3e-4, 2.0 * base_lr)))
+    print(f"  preflight lr {lr:g} (train lr {base_lr:g}; override: preflight.lr)")
+    opt = torch.optim.AdamW(model.parameters(), lr=lr,
                             betas=(0.9, 0.95), weight_decay=0.01)
     use_bf16 = device == "cuda"
     first, last = {}, {}
