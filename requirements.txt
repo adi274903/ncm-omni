@@ -1,0 +1,12 @@
+# Runtime deps for the omni NCM pipeline. torch is preinstalled on Colab/Kaggle images and is
+# pinned loosely here so a CUDA 12/13 wheel is not downgraded by a plain `pip install -r`.
+torch>=2.6
+numpy
+tqdm
+tensorboard
+# producer: Hub streaming + the three modality decoders
+datasets
+huggingface_hub
+soundfile
+av
+pillow
