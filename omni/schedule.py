@@ -18,7 +18,9 @@ from typing import Dict, Sequence, Tuple
 
 import torch
 
-MODALITIES = ("text", "image", "audio", "video")
+# Video is deliberately absent: a frame is an image, so video samples are encoded as
+# image samples and there is no separate code distribution to model or route.
+MODALITIES = ("text", "image", "audio")
 
 
 @dataclass

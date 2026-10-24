@@ -14,22 +14,81 @@ import sys
 import time
 
 import torch
+from tqdm.auto import tqdm
 
 from omni.data import EvalSet, ShardStream, collate, schedule_from_meta, to_device
-from omni.model import OmniConfig, OmniNCM, omni_loss
+from omni.model import OmniConfig, OmniNCM, omni_loss, omni_loss_stats
 from omni.schedule import MODALITIES, OmniSchedule
+
+
+def fast_math():
+    """Turn on the fast paths that are actually available on this box.
+
+    On CUDA the matmuls already go to cuBLAS and the attention to SDPA/flash - there is no
+    separate library to call. What is NOT on by default: TF32 for fp32 matmuls (A100/H100/L40S
+    only) and cuDNN benchmarking. Setting them is worth 10-40% on Ampere+ and costs nothing.
+    A JAX port would re-buy the same cuBLAS kernels for a week of work and lose flex_attention,
+    so the lever is kernels-per-step, not framework.
+    """
+    if not torch.cuda.is_available():
+        return {}
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:                                          # noqa: BLE001
+        pass
+    p = torch.cuda.get_device_properties(0)
+    return dict(device=p.name, sm=f"{p.major}.{p.minor}", mem_gb=round(p.total_memory / 2**30, 1),
+                tf32=True)
 
 
 def build(cfg):
     sch = cfg["sched"]
     sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
-                         null_code=sch.get("null_code", 0))
-    vocab = {m: int(cfg["vocab"][m]) for m in sched.modalities}
+                         null_code=sch.get("null_code", 0),
+                         modalities=tuple(sch.get("modalities") or MODALITIES))
+    # `vocab` may be {m: int} (old), {m: [V_0..V_{K-1}]} (heterogeneous head) or {m: {k: V}}.
+    # OmniConfig normalises it; passing the raw structure through keeps the cfgs diffable.
+    vocab = cfg["vocab"]
     m = cfg["model"]
     ocfg = OmniConfig(sched, vocab, n_embd=m["n_embd"], n_layer=m["n_layer"],
                       n_head=m["n_head"], n_kv_head=m["n_kv_head"], dropout=m.get("dropout", 0.0),
-                      qk_norm=m.get("qk_norm", True), mask_mode=m.get("mask_mode", "block"))
+                      qk_norm=m.get("qk_norm", True), mask_mode=m.get("mask_mode", "block"),
+                      n_experts=m.get("n_experts", 0), expert_map=m.get("expert_map"))
     return OmniNCM(ocfg), sched
+
+
+def make_writer(out_dir):
+    """TensorBoard over the same run dir. Returns None (with the fix printed) if unavailable."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception:                                          # noqa: BLE001
+        print("!! tensorboard is not installed: losses still go to metrics*.jsonl")
+        print("   pip install -q tensorboard   then:  %load_ext tensorboard")
+        print(f"   %tensorboard --logdir {os.path.join(out_dir, 'tb')}")
+        return None
+    d = os.path.join(out_dir, "tb")
+    os.makedirs(d, exist_ok=True)
+    print(f"tensorboard: %load_ext tensorboard; %tensorboard --logdir {d}")
+    return SummaryWriter(d)
+
+
+def preflight_gate(cfg, writer=None):
+    """Runs test C before any training. Aborts unless it passed (override: preflight.allow_fail)."""
+    pf = cfg.get("preflight") or {}
+    if not pf.get("enabled", True):
+        print("preflight: disabled in cfg (preflight.enabled=false)")
+        return True
+    from omni.preflight import run_preflight
+    res = run_preflight(cfg, writer=writer)
+    if not res["passed"] and not pf.get("allow_fail", False):
+        print("\nPREFLIGHT FAILED - refusing to start training.")
+        print("  the head/routing does not learn, so more steps cannot fix it.")
+        print("  set preflight.allow_fail=true only to debug the trainer itself.")
+        raise SystemExit(3)
+    return bool(res["passed"])
 
 
 def n_params(model):
@@ -47,9 +106,9 @@ def lr_at(step, cfg):
 
 @torch.no_grad()
 def evaluate(model, evals, sched, device, batch_size=8):
-    """Per (modality, level) loss and teacher-forced accuracy on the held-out shards."""
+    """Per (modality, level) loss + teacher-forced accuracy, plus a scalar val loss per group."""
     model.eval()
-    agg = {}
+    agg, tot_loss, tot_n = {}, 0.0, 0
     for group, ds in evals.items():
         for i in range(0, len(ds), batch_size):
             rows = [ds[j] for j in range(i, min(i + batch_size, len(ds)))]
@@ -88,6 +147,8 @@ def run(cfg, smoke=None):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    writer = make_writer(out_dir)
+    preflight_gate(cfg, writer)
     model, sched = build(cfg)
     model.to(dev).train()
     P = n_params(model)
@@ -116,7 +177,8 @@ def run(cfg, smoke=None):
 
     it = iter(stream)
     t0, toks = time.time(), 0
-    for step in range(steps):
+    pbar = tqdm(range(steps), desc="train", unit="step")
+    for step in pbar:
         rows = []
         while len(rows) < bs:
             try:
@@ -142,10 +204,21 @@ def run(cfg, smoke=None):
                    lr=opt.param_groups[0]["lr"],
                    samples_per_s=round((step + 1) / (time.time() - t0), 2),
                    pos_per_s=round(toks / (time.time() - t0), 1))
+        if writer is not None and (step % max(1, cfg.get("log_every", 10)) == 0
+                                   or step == steps - 1):
+            with torch.no_grad():
+                _, st = omni_loss_stats(logits, batch, sched)
+            writer.add_scalar("train/loss", float(loss.detach()), step)
+            writer.add_scalar("train/grad_norm", float(gn), step)
+            writer.add_scalar("train/lr", rec["lr"], step)
+            writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
+            for (mm, kk), v in st.items():
+                writer.add_scalar(f"train/ce/{mm}_L{kk}", v["ce"], step)
+        pbar.set_postfix(loss=f"{rec['loss']:.4f}", pos_s=rec["pos_per_s"])
         if step % cfg.get("log_every", 10) == 0 or step == steps - 1:
             metrics.write(json.dumps(rec) + "\n")
             metrics.flush()
-            print(json.dumps(rec))
+            pbar.write(json.dumps(rec))
         if evals and cfg.get("eval_every") and (step + 1) % cfg["eval_every"] == 0:
             ev = evaluate(model, evals, sched, dev, bs)
             metrics.write(json.dumps(dict(step=step, val=ev)) + "\n")
@@ -179,10 +252,14 @@ def run_duplex(cfg, smoke=None):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    writer = make_writer(out_dir)
+    preflight_gate(cfg, writer)
     arms = cfg.get("arms") or ["strict", "ar"]
     steps = smoke or cfg["steps"]
     bs = cfg.get("batch", 4)
     use_bf16 = dev == "cuda"
+    if dev == "cuda":
+        print("fast math:", fast_math())
 
     models, opts, sched, arm_cfg = {}, {}, None, {}
     for arm in arms:
@@ -223,7 +300,8 @@ def run_duplex(cfg, smoke=None):
     metrics = {a: open(os.path.join(out_dir, f"metrics_{a}.jsonl"), "a") for a in arms}
     it = iter(rows)
     t0, toks = time.time(), 0
-    for step in range(steps):
+    pbar = tqdm(range(steps), desc=f"duplex {arms}", unit="step")
+    for step in pbar:
         batch_rows = []
         while len(batch_rows) < bs:
             try:
@@ -249,13 +327,43 @@ def run_duplex(cfg, smoke=None):
             opts[arm].step()
             rec[arm] = round(float(loss.detach()), 5)
             rec[f"{arm}_gn"] = round(float(gn.detach()), 3)
+            if writer is not None and (step % max(1, cfg.get("log_every", 10)) == 0
+                                       or step == steps - 1):
+                with torch.no_grad():
+                    _, st = omni_loss_stats(logits, batch, sched)
+                writer.add_scalar(f"{arm}/loss", float(loss.detach()), step)
+                writer.add_scalar(f"{arm}/grad_norm", float(gn), step)
+                for (mm, kk), v in st.items():
+                    writer.add_scalar(f"{arm}/ce/{mm}_L{kk}", v["ce"], step)
         toks += bs * T
         rec["pos_per_s"] = round(toks / (time.time() - t0), 1)
+        if writer is not None:
+            writer.add_scalar("data/pos_per_s", rec["pos_per_s"], step)
+        pbar.set_postfix({a: f"{rec[a]:.4f}" for a in arms},
+                         pos_s=rec["pos_per_s"])
         if step % max(1, cfg.get("log_every", 10)) == 0 or step == steps - 1:
-            print(json.dumps(rec), flush=True)
+            pbar.write(json.dumps(rec))
             for arm in arms:
                 metrics[arm].write(json.dumps(rec) + "\n")
                 metrics[arm].flush()
+        if evals and cfg.get("eval_every") and (step + 1) % cfg["eval_every"] == 0:
+            for arm in arms:
+                # evaluate() returns {m_Lk: {ce, acc, n}}; val loss is the token-weighted CE.
+                ev = evaluate(models[arm], evals, sched, dev, bs)
+                tot_n = sum(v["n"] for v in ev.values())
+                vl = sum(v["ce"] * v["n"] for v in ev.values()) / max(1, tot_n)
+                pbar.write(f"  val {arm} @{step+1}: loss {vl:.4f}")
+                for key, v in ev.items():
+                    metrics[arm].write(json.dumps(dict(step=step, val=True, level=key,
+                                                       loss=round(v["ce"], 5),
+                                                       acc=round(v["acc"], 5),
+                                                       n=v["n"])) + "\n")
+                metrics[arm].write(json.dumps(dict(step=step, val=True, loss=round(vl, 5))) + "\n")
+                metrics[arm].flush()
+                if writer is not None:
+                    writer.add_scalar(f"{arm}/val_loss", vl, step)
+                    for key, v in ev.items():
+                        writer.add_scalar(f"{arm}/val_{key}", v["ce"], step)
         if cfg.get("save_every") and (step + 1) % cfg["save_every"] == 0:
             for arm in arms:
                 d = os.path.join(out_dir, f"train_{arm}")
@@ -290,6 +398,9 @@ def run_duplex(cfg, smoke=None):
     # "DUPLEX ... steps" with every checkpoint already on disk. This must come after the
     # save flush and before any early return (--smoke used to return here and hang the same
     # way). Everything is on disk by now; leave hard rather than hang a finished run.
+    if writer is not None:
+        writer.flush()
+        writer.close()
     if cfg.get("hard_exit", True):
         sys.stdout.flush()
         sys.stderr.flush()

@@ -137,7 +137,9 @@ def synthetic_batch(sched: OmniSchedule, vocab, B=2, seed=0, device="cpu", prese
     g = torch.Generator().manual_seed(seed)
     codes, present = {}, {}
     for m in sched.modalities:
-        flat = torch.randint(1, vocab[m], (B, sched.flat_len(m)), generator=g)
+        v = vocab[m]
+        top = max(v) if isinstance(v, (list, tuple, dict)) else int(v)   # per-level vocab
+        flat = torch.randint(1, top, (B, sched.flat_len(m)), generator=g)
         codes[m] = flat.to(device)
         present[m] = torch.ones(B, dtype=torch.bool, device=device)
     if not present_all:

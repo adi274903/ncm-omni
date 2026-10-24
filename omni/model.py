@@ -46,22 +46,68 @@ except Exception:                   # -> silent fallback to the unfused eager ke
     pass
 
 
+def normalize_vocab(vocab, modalities, K):
+    """-> {m: (V_0, ..., V_{K-1})}.
+
+    Accepts, in order of age:
+      * {m: int}                       one codebook per modality, every level (the old layout)
+      * {m: [int]*K} or {m: {k: int}}  a width per level (heterogeneous head: the finest text
+                                       level holds BPE ids, the coarse levels hold 256-way codes)
+      * int                            the same for every modality
+
+    Keeping every level the same width is still the default and still the only layout that loads
+    the pre-existing checkpoints: a heterogeneous model cannot read a `heads.text.weight`.
+    """
+    out = {}
+    for m in modalities:
+        v = vocab.get(m, 256) if isinstance(vocab, dict) else vocab
+        if isinstance(v, dict):
+            seq = [int(v[k]) for k in range(K)]
+        elif isinstance(v, (list, tuple)):
+            seq = [int(x) for x in v]
+            seq = (seq + [seq[-1]] * K)[:K]
+        else:
+            seq = [int(v)] * K
+        assert all(x >= 1 for x in seq), (m, seq)
+        out[m] = tuple(seq)
+    return out
+
+
 class OmniConfig:
     def __init__(self, sched: OmniSchedule, vocab: Dict[str, int], n_embd=384, n_layer=6,
                  n_head=6, n_kv_head=2, dropout=0.0, qk_norm=True,
-                 cond_mode="gt_embed", mask_mode="block", max_pos=None):
-        self.sched, self.vocab = sched, dict(vocab)
+                 cond_mode="gt_embed", mask_mode="block", max_pos=None,
+                 n_experts=0, expert_map=None):
+        self.sched = sched
+        self.vocab_raw = vocab
+        self.vocab = normalize_vocab(vocab, sched.modalities, sched.K)
         self.n_embd, self.n_layer = n_embd, n_layer
         self.n_head, self.n_kv_head = n_head, n_kv_head
         self.dropout, self.qk_norm = dropout, qk_norm
         self.cond_mode, self.mask_mode = cond_mode, mask_mode
+        self.n_experts = int(n_experts or 0)
+        self.expert_map = expert_map
         self.max_pos = max_pos or max(sched.base_len[m] for m in sched.modalities)
 
+    # -- vocab -------------------------------------------------------------
+    def vocab_at(self, m, k):
+        return self.vocab[m][k]
+
+    def vocab_max(self, m):
+        return max(self.vocab[m])
+
+    def is_hetero(self, m=None):
+        mods = self.sched.modalities if m is None else (m,)
+        return any(len(set(self.vocab[mm])) > 1 for mm in mods)
+
     def to_dict(self):
+        # A uniform modality serialises back to the old `int` form so old cfgs round-trip.
+        v = {m: (list(seq) if len(set(seq)) > 1 else seq[0]) for m, seq in self.vocab.items()}
         return dict(K=self.sched.K, R=self.sched.R, base_len=dict(self.sched.base_len),
-                    vocab=self.vocab, n_embd=self.n_embd, n_layer=self.n_layer,
+                    vocab=v, n_embd=self.n_embd, n_layer=self.n_layer,
                     n_head=self.n_head, n_kv_head=self.n_kv_head, dropout=self.dropout,
-                    qk_norm=self.qk_norm, cond_mode=self.cond_mode, mask_mode=self.mask_mode)
+                    qk_norm=self.qk_norm, cond_mode=self.cond_mode, mask_mode=self.mask_mode,
+                    n_experts=self.n_experts, expert_map=self.expert_map)
 
 
 def level_ids_for(sched: OmniSchedule, T: int, device="cpu"):
@@ -143,17 +189,42 @@ class OmniNCM(nn.Module):
         super().__init__()
         self.cfg, self.sched = cfg, cfg.sched
         d, K = cfg.n_embd, cfg.sched.K
-        self.tok_emb = nn.ModuleDict({m: nn.Embedding(cfg.vocab[m] + 1, d)
+        # The embedding table is sized by the widest level of that modality; coarse levels simply
+        # never index past their own (smaller) range.
+        self.tok_emb = nn.ModuleDict({m: nn.Embedding(cfg.vocab_max(m) + 1, d)
                                       for m in cfg.sched.modalities})
         self.mod_emb = nn.Embedding(len(cfg.sched.modalities) + 1, d)   # +1 = prefix slot
         self.level_emb = nn.Embedding(K, d)
         self.pos_emb = nn.Embedding(cfg.max_pos + 1, d)
         self.cond_proj = nn.Linear(d, d)
-        self.blocks = nn.ModuleList([Block(d, cfg.n_head, cfg.n_kv_head, cfg.dropout,
-                                           qk_norm=cfg.qk_norm) for _ in range(cfg.n_layer)])
+        # MoE: shared trunk, per-modality experts. A uniform model keeps the dense FFN, so old
+        # checkpoints keep loading.
+        self.moe = bool(cfg.n_experts)
+        if self.moe:
+            from omni.moe import MoEBlock, resolve_expert_map
+            self._emap, self.n_experts = resolve_expert_map(
+                cfg.sched.modalities, cfg.expert_map, cfg.n_experts)
+            blocks = [MoEBlock(Block(d, cfg.n_head, cfg.n_kv_head, cfg.dropout, qk_norm=cfg.qk_norm),
+                               d, self.n_experts) for _ in range(cfg.n_layer)]
+        else:
+            self._emap, self.n_experts = None, 0
+            blocks = [Block(d, cfg.n_head, cfg.n_kv_head, cfg.dropout, qk_norm=cfg.qk_norm)
+                      for _ in range(cfg.n_layer)]
+        self.blocks = nn.ModuleList(blocks)
         self.ln_f = RMSNorm(d)
-        self.heads = nn.ModuleDict({m: nn.Linear(d, cfg.vocab[m], bias=False)
-                                    for m in cfg.sched.modalities})
+        # One head per modality when every level shares a width (old layout, loads old ckpts);
+        # one head per (modality, level) when the finest level is wider (BPE ids).
+        self.heads = nn.ModuleDict()
+        for m in cfg.sched.modalities:
+            if cfg.is_hetero(m):
+                for k in range(K):
+                    self.heads[f"{m}_L{k}"] = nn.Linear(d, cfg.vocab_at(m, k), bias=False)
+            else:
+                self.heads[m] = nn.Linear(d, cfg.vocab_at(m, 0), bias=False)
+
+    def head(self, m, k):
+        key = f"{m}_L{k}"
+        return self.heads[key] if key in self.heads else self.heads[m]
 
     # ------------------------------------------------------------------ packing
     def _mod_level_emb(self, m, k, codes_mk, cond):
@@ -240,12 +311,21 @@ class OmniNCM(nn.Module):
                                           cross_level, mask_mode)
         else:
             kw["dense_mask"] = trunc_mask(self.sched, T, x.dtype, x.device, cross_level, mask_mode)
-        lev, _, pos = level_ids_for(self.sched, T, x.device)
+        lev, mod, pos = level_ids_for(self.sched, T, x.device)
         rope = precompute_rope_cos_sin(pos, self.cfg.n_embd // self.cfg.n_head)
+        eid = self._expert_ids(mod) if self.moe else None
         h = x
         for b in self.blocks:
-            h = b(h, rope=rope, **kw)
+            h = b(h, rope=rope, mod_id=eid, **kw) if self.moe else b(h, rope=rope, **kw)
         return self.ln_f(h)
+
+    def _expert_ids(self, mod):
+        """Packed modality index -> expert index. Prefix slots take expert 0."""
+        assert self._emap is not None
+        e = torch.zeros_like(mod)
+        for i, ex in enumerate(self._emap):
+            e[mod == i] = ex
+        return e
 
     def forward(self, batch, cross_level=False, use_flex=None):
         """batch = {"codes": {m: [B,flat]}, "present": {m: [B] bool}} -> {(m,k): logits}."""
@@ -259,7 +339,7 @@ class OmniNCM(nn.Module):
                 l = self.sched.level_len(m, k)
                 off_in_block = sum(self.sched.level_len(mm, k)
                                    for mm in self.sched.modalities[:self.sched.modalities.index(m)])
-                out[(m, k)] = self.heads[m](h[:, q0 + off_in_block:q0 + off_in_block + l])
+                out[(m, k)] = self.head(m, k)(h[:, q0 + off_in_block:q0 + off_in_block + l])
         return out
 
     def _qoff(self, k):
@@ -281,7 +361,7 @@ class OmniNCM(nn.Module):
             c = 0
             for m in S.modalities:
                 l = S.level_len(m, k)
-                lg = self.heads[m](h[:, q0 + c:q0 + c + l])
+                lg = self.head(m, k)(h[:, q0 + c:q0 + c + l])
                 c += l
                 if temperature and temperature > 0:
                     idx = torch.multinomial(F.softmax(lg / temperature, -1).reshape(-1, lg.size(-1)), 1)
@@ -307,7 +387,7 @@ class OmniNCM(nn.Module):
             x = self.pack(buf, upto=k + 1, dummy_level=k)
             h = self.encode(x, use_flex=use_flex)
             q0 = self._qoff(k) + sum(S.level_len(mm, k) for mm in S.modalities[:S.modalities.index(m)]) + i
-            idx = self.heads[m](h[:, q0:q0 + 1]).argmax(-1)
+            idx = self.head(m, k)(h[:, q0:q0 + 1]).argmax(-1)
             buf[m][0, S.offsets(m)[k] + i] = idx[0, 0]
         return {m: buf[m] for m in S.modalities}, len(order)
 
@@ -348,6 +428,36 @@ def omni_loss(logits, batch, sched: OmniSchedule, label_smoothing=0.0, chunk=Non
             total = loss_k if total is None else total + loss_k
             n += int(flat_keep.sum())
     return (total / max(1, n)) if total is not None else torch.zeros((), device=next(iter(codes.values())).device)
+
+
+def omni_loss_stats(logits, batch, sched: OmniSchedule, label_smoothing=0.0):
+    """-> (mean CE, {(m,k): {"ce": float, "n": int}}).
+
+    Same arithmetic as `omni_loss`, but it also returns the per-level breakdown, which is what
+    the preflight gates on and what TensorBoard plots. Kept separate so the optimiser path stays
+    the single scalar it always was.
+    """
+    codes, pres = batch["codes"], batch["present"]
+    total, n, out = None, 0, {}
+    for k in range(sched.K):
+        for m in sched.modalities:
+            l, off = sched.level_len(m, k), sched.offsets(m)[k]
+            tg = codes[m][:, off:off + l]
+            keep = (tg != sched.null_code) & pres[m].unsqueeze(1)
+            if not keep.any():
+                continue
+            lg = logits[(m, k)]
+            flat_lg, flat_keep = lg.reshape(-1, lg.size(-1)), keep.reshape(-1)
+            flat_tg = tg.reshape(-1).clone()
+            flat_tg[~flat_keep] = -100
+            loss_k = F.cross_entropy(flat_lg, flat_tg, reduction="sum", ignore_index=-100,
+                                     label_smoothing=label_smoothing)
+            cnt = int(flat_keep.sum())
+            out[(m, k)] = {"ce": float(loss_k) / max(1, cnt), "n": cnt}
+            total = loss_k if total is None else total + loss_k
+            n += cnt
+    mean = (total / max(1, n)) if total is not None else torch.zeros((), device=self_dev(codes))
+    return mean, out
 
 
 def self_dev(codes):

@@ -57,6 +57,24 @@ def apply_overrides(cfg, a):
         # video stays at 32: its base_len is frames x grid^2, so 512 would read 128 frames of
         # every clip. It is data-path only and currently dead in eval, so it is not worth the
         # decode. Raise it in build_codec if that ever changes.
+    moe = getattr(a, "moe", 0)
+    if moe:
+        cfg["model"]["n_experts"] = int(moe)
+        cfg["model"]["expert_map"] = {"text": 0, "image": 1, "audio": 2}
+    hv = getattr(a, "hetero_vocab", 0)
+    if hv:
+        K = cfg["sched"]["K"]
+        v = dict(cfg["vocab"])
+        v["text"] = [int(cfg["vocab"]["text"])] * (K - 1) + [int(hv)]
+        cfg["vocab"] = v
+    ev = getattr(a, "eval_every", None)
+    if ev:
+        cfg["train"]["eval_every"] = int(ev)
+    pfs = getattr(a, "preflight_steps", None)
+    if pfs is not None:
+        cfg.setdefault("preflight", {})["steps"] = int(pfs)
+    if getattr(a, "no_preflight", False):
+        cfg.setdefault("preflight", {})["enabled"] = False
     m = getattr(a, "holdout_mult", 0)
     if m:
         cfg["produce"]["holdout"] = {k: int(v * m) for k, v in cfg["produce"]["holdout"].items()}
@@ -69,23 +87,28 @@ def write_cfgs_all(cfg, budget=None, steps=None):
 
 def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
     return dict(
-        sched=dict(base_len=dict(text=64, image=64, audio=96, video=32), K=6, R=2, null_code=0),
-        vocab=dict(text=257, image=257, audio=257, video=257),   # codebook_size + the NULL slot
+        # three modalities: video was dropped because a frame is an image, so frames are encoded
+        # as image samples instead of training a modality that measured below its copy prior.
+        sched=dict(modalities=["text", "image", "audio"],
+                   base_len=dict(text=64, image=64, audio=96), K=6, R=2, null_code=0),
+        vocab=dict(text=257, image=257, audio=257),   # codebook_size + the NULL slot
         model=dict(n_embd=384, n_layer=6, n_head=6, n_kv_head=2, dropout=0.0,
                    qk_norm=True, mask_mode="block"),
         train=dict(steps=2000, batch=8, lr=3e-4, warmup=100, wd=0.01, clip=1.0,
-                   log_every=10, eval_every=250, save_every=500),
+                   log_every=10, eval_every=1000, save_every=500),
         produce=dict(out_dir=out, sample_budget=budget, shard_samples=64,
                      max_ahead_shards=24, shuffle_buf=512, batch_docs=8, seed=3407,
-                     holdout=dict(text=32, image=24, audio=16, video=8),
-                     mix=dict(text_fineweb=0.14, text_cosmopedia=0.08, text_wikipedia=0.05,
-                              text_math_web=0.08, text_math_fine=0.07, text_math_numina=0.06,
-                              text_arxiv=0.07, text_code=0.10, text_code_inst=0.05,
+                     holdout=dict(text=32, image=24, audio=16),
+                     # 60 / 20 / 20 text / vision / audio. Text no longer has a video slice to
+                     # give away, and audio was tripled: it is the modality whose finest level was
+                     # starved at 8% of the mix.
+                     mix=dict(text_fineweb=0.12, text_cosmopedia=0.07, text_wikipedia=0.04,
+                              text_math_web=0.07, text_math_fine=0.06, text_math_numina=0.05,
+                              text_arxiv=0.06, text_code=0.09, text_code_inst=0.04,
                               image_docvqa=0.05, image_imagenet=0.05, image_coco=0.04,
                               image_wikiart=0.03, image_flowers=0.02, image_food=0.01,
-                              audio_libri=0.03, audio_libritts=0.02, audio_fleurs=0.02,
-                              audio_peoples=0.01,
-                              video_ucf=0.02),
+                              audio_libri=0.075, audio_libritts=0.05, audio_fleurs=0.05,
+                              audio_peoples=0.025),
                      codebook_size=256, prefer_real=True,
                      K=None, R=None, base_len=None),
     )
@@ -95,7 +118,8 @@ def write_cfgs(cfg, budget=None, steps=None):
     from omni.schedule import OmniSchedule
     os.makedirs(os.path.join(RUN, "cfg"), exist_ok=True)
     sch = cfg["sched"]
-    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"])
+    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
+                         modalities=tuple(sch.get("modalities") or MODALITIES))
     prod = dict(cfg["produce"])
     if budget:
         prod["sample_budget"] = budget
@@ -172,7 +196,8 @@ def cmd_check(args):
 def prod_cfg_only(cfg):
     from omni.schedule import OmniSchedule
     sch = cfg["sched"]
-    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"])
+    sched = OmniSchedule(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
+                         modalities=tuple(sch.get("modalities") or MODALITIES))
     p = {k: v for k, v in cfg["produce"].items() if k not in ("K", "R", "base_len")}
     p.update(base_len=sch["base_len"], K=sch["K"], R=sch["R"],
              codebook_size=cfg["produce"]["codebook_size"], only_sources=None)
@@ -386,12 +411,22 @@ def main(argv=None):
     ap.add_argument("--save-every", type=int, default=None, dest="save_every",
                     help="checkpoint interval; the live-stream path has no replay, so this is "
                          "the only way to survive a Colab session limit")
+    ap.add_argument("--eval-every", type=int, default=None, dest="eval_every",
+                    help="validation loss every N steps on the held-out shards (default 1000)")
     ap.add_argument("--arms", default=None,
                     help="comma list to train in one process off the live stream, e.g. strict,ar. "
                          "No shard corpus is produced or read: both arms step the same batch.")
     ap.add_argument("--foreground", action="store_true")
     ap.add_argument("--workers", type=int, default=1,
                     help="producer processes; each reads index i mod N of every stream")
+    ap.add_argument("--moe", type=int, default=0,
+                    help="n_experts (1 per modality). 0 = dense trunk, the old layout")
+    ap.add_argument("--hetero-vocab", type=int, default=0, dest="hetero_vocab",
+                    help="finest-level text vocab, e.g. 8000 or 32000; 0 = one codebook per level")
+    ap.add_argument("--preflight-steps", type=int, default=None, dest="preflight_steps",
+                    help="test C steps that run before training (default 300)")
+    ap.add_argument("--no-preflight", action="store_true", dest="no_preflight",
+                    help="skip test C - only to debug the trainer itself")
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
                     help="sm=10.44M (debug), md=84.6M (kill test), lg=454M")
     ap.add_argument("--base-len", type=int, default=0,
