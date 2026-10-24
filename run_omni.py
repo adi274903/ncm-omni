@@ -132,7 +132,10 @@ def write_cfgs(cfg, budget=None, steps=None):
                    ar_ckpt=os.path.join(RUN, "train_ar", "final.pt"),
                    strict_ckpt=os.path.join(RUN, "train_strict", "final.pt"),
                    eval_files=sorted(glob.glob(os.path.join(prod["out_dir"], "eval_*.npz"))),
-                   n_samples=48, out=os.path.join(RUN, "eval_table.json")),
+                   # 0 = every held-out row. 48 of the ~320 rows a x4 carve produces threw
+                   # away 85% of the eval signal, and the AR-parity score reads one slot per
+                   # modality per row, so its error bar is set by this number.
+                   n_samples=0, out=os.path.join(RUN, "eval_table.json")),
               open(paths["eval"], "w"), indent=2)
     print("wrote", ", ".join(paths.values()))
     return paths

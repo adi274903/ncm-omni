@@ -210,10 +210,20 @@ def run(cfg):
     strict = loaded.get("level-parallel(strict)")
     ar = loaded.get("autoregressive")
 
-    files = [f for f in (cfg.get("eval_files") or []) if os.path.exists(f)]
-    if not files:                                  # cfg was written before the producer ran
-        import glob
-        files = sorted(glob.glob(os.path.join(ck["cfg"]["shard_dir"], "eval_*.npz")))
+    ev = cfg.get("eval_files") or []
+    if isinstance(ev, dict):                       # train cfgs store {group: path}
+        ev = list(ev.values())
+    files = [f for f in ev if os.path.exists(f)]
+    # The eval cfg stores a SNAPSHOT of the eval_*.npz files that existed when it was written.
+    # A `check` that runs before the audio/video carve finishes therefore bakes in a two-modality
+    # eval, and those columns read "-" forever with no error. Re-glob beside the files we did find
+    # (or beside the shards) so a stale list heals itself.
+    import glob
+    dirs = sorted({os.path.dirname(f) for f in files}) or [ck["cfg"].get("shard_dir", "")]
+    for d in dirs:
+        for f in sorted(glob.glob(os.path.join(d, "eval_*.npz"))):
+            if f not in files:
+                files.append(f)
     assert files, "no eval shards found: let the producer write eval_*.npz first"
     rows = []
     for f in files:
