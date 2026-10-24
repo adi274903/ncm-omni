@@ -264,7 +264,7 @@ def run(cfg, smoke=None):
 
     it = iter(stream)
     t0, toks = time.time(), 0
-    pbar = tqdm(range(steps), desc="train", unit="step")
+    pbar = tqdm(range(steps), desc="train", unit="step", disable=not sys.stderr.isatty())
     for step in pbar:
         rows = []
         while len(rows) < bs:
@@ -395,7 +395,8 @@ def run_duplex(cfg, smoke=None):
     metrics = {a: open(os.path.join(out_dir, f"metrics_{a}.jsonl"), "a") for a in arms}
     it = iter(rows)
     t0, toks = time.time(), 0
-    pbar = tqdm(range(steps), desc=f"duplex {arms}", unit="step")
+    pbar = tqdm(range(steps), desc=f"duplex {arms}", unit="step",
+              disable=not sys.stderr.isatty())
     for step in pbar:
         batch_rows = []
         while len(batch_rows) < bs:

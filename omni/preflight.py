@@ -19,6 +19,7 @@ Level 0 is printed for reference and never gated: it is a prior over the coarses
 """
 import copy
 import math
+import sys
 import time
 from typing import Dict
 
@@ -82,6 +83,9 @@ def run_preflight(cfg, writer=None, steps=None, batch=None, device=None, verbose
 
     if verbose:
         print("\n=== PREFLIGHT (test C) ===")
+        if str(device) == "cpu":
+            print("!! running on CPU: 300 steps at this size takes minutes, not seconds.")
+            print("   Colab: Runtime -> Change runtime type -> GPU, then re-run the hardware cell.")
         print(f"model {P/1e6:.2f}M total | {active/1e6:.2f}M active/token | "
               f"experts {getattr(model, 'n_experts', 0)} | mask {c['model']['mask_mode']}")
         vs = " ".join(f"{m}=" + (str(oc.vocab[m][0]) if len(set(oc.vocab[m])) == 1
@@ -99,7 +103,11 @@ def run_preflight(cfg, writer=None, steps=None, batch=None, device=None, verbose
     first, last = {}, {}
     usage = None
     bad = None
-    pbar = tqdm(range(steps), desc="preflight", disable=not verbose, leave=True)
+    # tqdm draws with \r, and the Colab cell reads the child through a pipe line-by-line, so a bar
+    # on a non-tty is invisible until it finishes - which reads as a hang and gets Ctrl-C'd. Show
+    # the bar only on a real terminal; otherwise print newline-terminated lines.
+    interactive = verbose and sys.stderr.isatty()
+    pbar = tqdm(range(steps), desc="preflight", disable=not interactive, leave=True)
     for step in pbar:
         batch_d = _structured_batch(sched, oc, B, device, seed=step)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -124,6 +132,9 @@ def run_preflight(cfg, writer=None, steps=None, batch=None, device=None, verbose
             writer.add_scalar("preflight/loss", float(loss.detach()), step)
             for (m, k), v in stats.items():
                 writer.add_scalar(f"preflight/ce_{m}_L{k}", v["ce"], step)
+        if not interactive and verbose and (step + 1) % max(1, steps // 10) == 0:
+            print(f"  preflight {step+1:>4}/{steps}  loss {float(loss.detach()):.3f}  "
+                  f"{time.time()-t0:.0f}s", flush=True)
         pbar.set_postfix(loss=f"{float(loss.detach()):.3f}", **{
             f"{m[0]}{k}": f"{v['ce']:.2f}" for (m, k), v in list(stats.items())[-3:]})
 
