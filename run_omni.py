@@ -156,7 +156,10 @@ def write_cfgs(cfg, budget=None, steps=None):
                  eval_files={g: os.path.join(prod["out_dir"], f"eval_{g}.npz")
                              for g in prod["holdout"]},
                  consume=False,          # both arms read the same shards
-                 stream_timeout=1800)
+                 stream_timeout=1800,
+                 # without this the child never sees the preflight section, so --no-preflight,
+                 # --preflight-steps and --preflight-lr were silently dropped on the shard path
+                 preflight=cfg.get("preflight") or {})
         json.dump(t, open(paths[arm], "w"), indent=2)
 
     import glob
