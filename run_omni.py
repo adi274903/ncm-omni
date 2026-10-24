@@ -196,7 +196,7 @@ def cmd_check(args):
     out = m(b)
     print("logits:", {f"{k[0]}_L{k[1]}": tuple(v.shape) for k, v in list(out.items())[:4]}, "...")
 
-    prod = subprocess.run([sys.executable, "-m", "omni.producer", "--selfcheck",
+    prod = subprocess.run([sys.executable, "-u", "-m", "omni.producer", "--selfcheck",
                            _write_tmp(prod_cfg_only(cfg))],
                           cwd=HERE, capture_output=True, text=True)
     print(prod.stdout[-800:] or prod.stderr[-800:])
@@ -241,7 +241,7 @@ def cmd_produce(args):
     nworkers = max(1, args.workers)
     if nworkers == 1:
         log = open(os.path.join(RUN, "producer.log"), "w")
-        p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
+        p = subprocess.Popen([sys.executable, "-u", "-m", "omni.producer", paths["produce"]],
                              cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
         print("producer pid", p.pid, "-> ", os.path.join(RUN, "producer.log"))
         if args.foreground:
@@ -274,7 +274,7 @@ def cmd_produce(args):
         if i:
             time.sleep(2.5)                  # spread the initial burst of stream opens
         procs.append(subprocess.Popen(
-            [sys.executable, "-m", "omni.producer", cp, "--worker", f"{i}/{nworkers}"],
+            [sys.executable, "-u", "-m", "omni.producer", cp, "--worker", f"{i}/{nworkers}"],
             cwd=HERE, stdout=f, stderr=subprocess.STDOUT))
     print(f"{nworkers} producers | budget {total} -> {per}/worker | logs run/producer_w*.log")
     if not args.foreground:
@@ -369,7 +369,7 @@ def cmd_train(args):
         tcfg["hard_exit"] = False
         print("in-process: hard exit disabled, the cell keeps running after the last step")
         return run_duplex(tcfg, smoke=args.smoke or None)
-    cmd = [sys.executable, "-m", "omni.train", which]
+    cmd = [sys.executable, "-u", "-m", "omni.train", which]
     if args.smoke:
         cmd += ["--smoke", str(args.smoke)]
     return subprocess.call(cmd, cwd=HERE)
@@ -378,7 +378,7 @@ def cmd_train(args):
 def cmd_eval(args):
     cfg = apply_overrides(default_cfg(), args)
     paths = write_cfgs(cfg)
-    return subprocess.call([sys.executable, "-m", "omni.eval", paths["eval"]], cwd=HERE)
+    return subprocess.call([sys.executable, "-u", "-m", "omni.eval", paths["eval"]], cwd=HERE)
 
 
 def cmd_all(args):
@@ -388,7 +388,7 @@ def cmd_all(args):
     os.makedirs(RUN, exist_ok=True)
     stream_dir = cfg["produce"]["out_dir"]
     log = open(os.path.join(RUN, "producer.log"), "w")
-    p = subprocess.Popen([sys.executable, "-m", "omni.producer", paths["produce"]],
+    p = subprocess.Popen([sys.executable, "-u", "-m", "omni.producer", paths["produce"]],
                          cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
     print("producer pid", p.pid)
     t0 = time.time()
@@ -405,12 +405,12 @@ def cmd_all(args):
     print(f"EVAL_READY after {time.time() - t0:.0f}s")
     rc = 0
     for arm in ("block", "ar"):
-        cmd = [sys.executable, "-m", "omni.train", paths[f"train_{arm}"]]
+        cmd = [sys.executable, "-u", "-m", "omni.train", paths[f"train_{arm}"]]
         if args.smoke:
             cmd += ["--smoke", str(args.smoke)]
         rc |= subprocess.call(cmd, cwd=HERE)
     if not args.smoke:
-        rc |= subprocess.call([sys.executable, "-m", "omni.eval", paths["eval"]], cwd=HERE)
+        rc |= subprocess.call([sys.executable, "-u", "-m", "omni.eval", paths["eval"]], cwd=HERE)
     open(os.path.join(stream_dir, "STOP"), "w").write("1")     # let a back-pressured producer exit
     p.terminate()
     return rc
