@@ -29,6 +29,12 @@ class Codec:
     """Interface. K / R / base_len must match the schedule the producer was configured with."""
     name = "codec"
     kind = "synthetic"
+    # `tier` is what the codebook actually is, and it travels into every shard's meta:
+    #   standin  deterministic placeholder whose ladder is real and whose codebook is not
+    #   bytes    UTF-8 bytes: the bottom rung decodes exactly by construction
+    #   learned  a pretrained / trained codebook (DAC, DINO+kmeans, tree, entropy segmentation)
+    tier = "standin"
+    note = ""
     exact_at_finest = False
     decodable = False
 
@@ -51,7 +57,9 @@ class Codec:
     def info(self):
         return dict(name=self.name, kind=self.kind, K=self.K, R=self.R, V=self.V,
                     base_len=self.base_len, decodable=self.decodable,
-                    exact_at_finest=self.exact_at_finest)
+                    exact_at_finest=self.exact_at_finest,
+                    tier=getattr(self, "tier", "standin"),
+                    note=getattr(self, "note", ""))
 
 
 # ------------------------------------------------------------------ shared machinery
@@ -121,7 +129,7 @@ class TextByteCodec(Codec):
     tokenizer gets ~99.99% exact text reconstruction; bytes get 100% by construction, so the
     honest claim here is only "the bottom of the ladder is lossless").
     """
-    kind, name, exact_at_finest, decodable = "real", "text_byte", True, True
+    kind, name, tier, exact_at_finest, decodable = "real", "text_byte", "bytes", True, True
 
     def __init__(self, K=6, R=2, codebook_size=256, base_len=64, seed=1):
         super().__init__(K, R, codebook_size, base_len)
@@ -153,7 +161,8 @@ class ImagePyramidCodec(Codec):
     decode() inverts the finest level, so per-level PSNR against the real image is a number you
     can report rather than a placeholder.
     """
-    kind, name, decodable = "real", "image_pyramid", True
+    kind, name, tier, decodable = "real", "image_pyramid", "standin", True
+    note = "patch-mean pyramid + 6-bin RGB quantiser: the ladder is real, the codebook is not"
 
     def __init__(self, K=6, R=2, codebook_size=256, base_len=64):
         super().__init__(K, R, codebook_size, base_len)
@@ -180,7 +189,8 @@ class VideoPyramidCodec(Codec):
     clip must be the clip at R^(K-1-k) the spatio-temporal detail, or its slots are not
     comparable to the image slots at the same level.
     """
-    kind, name, decodable = "real", "video_pyramid", True
+    kind, name, tier, decodable = "real", "video_pyramid", "standin", True
+    note = "frame x patch pyramid: the ladder is real, the codebook is not"
 
     def __init__(self, K=6, R=2, codebook_size=256, base_len=32, n_frames=8, grid=2):
         super().__init__(K, R, codebook_size, base_len)
@@ -244,7 +254,8 @@ class AudioMelPyramidCodec(Codec):
     column, so this uses a fixed seeded random codebook (nearest prototype in normalised mel
     space). The ladder is real; the codebook is a stand-in for DAC/EnCodec.
     """
-    kind, name, decodable = "real", "audio_mel_pyramid", True
+    kind, name, tier, decodable = "real", "audio_mel_pyramid", "standin", True
+    note = "log-mel rate pyramid over a FIXED seeded codebook: stand-in for DAC/dual-stream"
 
     def __init__(self, K=6, R=2, codebook_size=256, base_len=96, n_mels=32, seed=7):
         super().__init__(K, R, codebook_size, base_len)
@@ -285,8 +296,11 @@ class AudioMelPyramidCodec(Codec):
         return self.C[:, idx].T                                            # [l, n_mels]
 
 
-def build_codec(modality, K, R, V, base_len, prefer_real=True):
-    """Pick the strongest codec that is importable here. Never silently pretend."""
+TIERS = ("auto", "learned", "standin", "bytes")
+
+
+def _standin(modality, K, R, V, base_len, prefer_real=True):
+    """The dependency-free codec for each modality: real ladder, placeholder codebook."""
     if modality == "text":
         return TextByteCodec(K, R, V, base_len) if prefer_real else SpanHashCodec(K, R, V, base_len)
     if modality == "image":
@@ -298,3 +312,40 @@ def build_codec(modality, K, R, V, base_len, prefer_real=True):
     if modality == "audio":
         return AudioMelPyramidCodec(K, R, V, base_len)
     return SpanHashCodec(K, R, V, base_len)
+
+
+def build_codec(modality, K, R, V, base_len, prefer_real=True, tier="auto"):
+    """Pick the strongest codec importable here. Never silently pretend.
+
+    tier:
+      auto     learned codec when this machine can build one, else the stand-in. Whichever wins is
+               recorded in `codec.info()["tier"]` (and in every shard's meta) together with the
+               reason the learned one was skipped - a fallback that is not visible is a lie.
+      learned  only a learned codec; raises RuntimeError with the exact reason when unavailable.
+      standin  the dependency-free placeholder (patch-mean pyramid, seeded mel codebook, hashed
+               spans). Use this for byte-identical reproduction of an existing run.
+      bytes    standin, text forced to exact UTF-8 bytes on every rung's input (same object).
+
+    See docs/codecs.md for which published codec each choice corresponds to and why.
+    """
+    tier = (tier or "auto").lower()
+    if tier not in TIERS:
+        raise ValueError(f"unknown codec tier {tier!r}; pick one of {TIERS}")
+
+    if tier in ("auto", "learned"):
+        reason = ""
+        try:
+            from omni.codecs_learned import build_learned
+            codec, reason = build_learned(modality, K, R, V, base_len, tier)
+        except Exception as e:                                  # noqa: BLE001
+            codec, reason = None, f"{type(e).__name__}: {str(e)[:160]}"
+        if codec is not None:
+            return codec
+        if tier == "learned":
+            raise RuntimeError(f"tier=learned asked for {modality}, unavailable: {reason}")
+
+    codec = _standin(modality, K, R, V, base_len, prefer_real)
+    if tier in ("auto", "learned"):
+        codec.note = (f"learned {modality} codec unavailable ({reason}); "
+                      f"using stand-in {codec.name}")
+    return codec

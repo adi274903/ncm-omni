@@ -153,7 +153,7 @@ def iter_rows(pcfg, holdout=None, eval_dir=None, verbose=True, max_queue=512):
     """
     sched = _sched_of(pcfg)
     V = pcfg["codebook_size"]
-    codecs = make_codecs(sched, V, pcfg.get("prefer_real", True))
+    codecs = make_codecs(sched, V, pcfg.get("prefer_real", True), pcfg.get("codec_tier", "auto"))
     meta = schedule_meta(sched, codecs, V)
     rng = random.Random(pcfg.get("seed", 3407))
 

@@ -132,7 +132,7 @@ def _geometry(sched: OmniSchedule):
 
     Not `id(sched)`: a schedule rebuilt from the same cfg between calls must hit the same entry.
     """
-    return (tuple(sorted(sched.base_len.items())), sched.K, sched.R,
+    return (tuple(sorted(sched.base_len.items())), sched.K, tuple(sorted(sched.Rm.items())),
             sched.prefix_len, tuple(sched.modalities), sched.null_code)
 
 

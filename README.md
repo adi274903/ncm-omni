@@ -1,5 +1,8 @@
 # ncm_omni — streamed multimodal pipeline for level-parallel NCM
 
+> **Start here: [STUDY.md](STUDY.md)** - training a 1.68B sparse MoE on one GPU (about 170 TFLOPS), what broke (audio overfit), the ablations, and what I'd change with 8 GPUs. Work in progress; no weights are published.
+
+
 Level-parallel coarse-to-fine generation across **text + image + audio** (video in the data
 path), built on the kernel-optimised core in `../ncm_fused/core.py`.
 
@@ -8,7 +11,8 @@ path), built on the kernel-optimised core in `../ncm_fused/core.py`.
 | file | role |
 |---|---|
 | `omni/schedule.py` | level *k* = compression ratio `R**(K-1-k)` in **every** modality; level-major packing so one block = one altitude across modalities |
-| `omni/codecs.py` | frozen codecs, all producing the exact schedule ladder: text bytes (finest decodes exactly), image patch pyramid, video frame×patch pyramid, audio log-mel rate pyramid over a fixed seeded codebook, span-hash fallback |
+| `omni/codecs.py` | frozen codecs, all producing the exact schedule ladder: text bytes (finest decodes exactly), image patch pyramid, video frame×patch pyramid, audio log-mel rate pyramid over a fixed seeded codebook, span-hash fallback. `build_codec(..., tier=)` picks the tier and records it in `codec.info()["tier"]` |
+| `omni/codecs_learned.py` | the learned tier: byte-entropy text segmentation, a post-hoc codebook tree over any flat codebook (Tree-VQ style), optional DINO+k-means image and DAC audio adapters. Falls back **visibly** — see `docs/codecs.md` |
 | `omni/producer.py` | **streaming producer**: HF sources → codes → self-describing `.npz` shards, rolling buffer, back-pressure, deterministic resume, holdout per group, `EVAL_READY`/`DONE`/`STOP` |
 | `omni/data.py` | `ShardStream` (consumes and deletes shards), collate to the packed batch contract, synthetic batches |
 | `omni/model.py` | `OmniNCM`: one transformer, block-diagonal mask (parallel arm) or causal raster (AR arm), level-conditioned by `gt_embed`; `selfcheck()` = 7 invariants |
@@ -31,6 +35,20 @@ python run_omni.py eval                  # the table
 `core.py` must be importable: either copy it next to `run_omni.py`, or set `NCM_CORE_DIR`.
 The model imports `Block`, `RMSNorm`, `precompute_rope_cos_sin`, `HAS_FLEX` from it.
 
+## Codecs: which tier produced the shards
+
+`produce.json` has `codec_tier`: `auto` (default), `learned` or `standin`. `auto` uses a learned
+codec when this machine can build one — text **always** (byte-entropy segmentation), image if a
+k-means codebook exists, audio if `descript-audio-codec` is installed — and otherwise the
+dependency-free stand-in. Whichever wins, plus the reason it fell back, is printed by
+`run_omni.py check` and written into every shard's `meta.codecs`. `standin` reproduces an existing
+run byte-for-byte.
+
+This means **shards are only comparable within one tier**: `auto` on a bare box gives text the
+entropy codec and image/audio the stand-ins, which is not the same data a Colab run with
+`transformers`/`dac` produces. Regenerate rather than mix. Which published codec each choice
+corresponds to, why, and what is still missing: **`docs/codecs.md`**.
+
 ## Design decisions that are load-bearing
 
 1. **Levels are bound to compression, not to length.** `l[m][k] = base_len[m] / R**(K-1-k)`.
@@ -46,7 +64,9 @@ The model imports `Block`, `RMSNorm`, `precompute_rope_cos_sin`, `HAS_FLEX` from
    occupy attention slots — cheap, and it keeps the pack shape static.
 5. **Audio is the weak link, by construction.** Its hierarchy is temporal *rate*; pooling a
    spectrogram 32x destroys formants. If audio's fine level sags while text/image hold, that is
-   the finding, not a bug.
+   the finding, not a bug. The published fix is a dual-stream semantic/acoustic codec at a fixed
+   low frame rate plus variable-rate budgeted events (DualCodec 12.5 Hz, RubatoCodec) —
+   `docs/codecs.md` §4, not a tuning knob.
 6. **Codes are 1-based; 0 is NULL.** Every codec emits `1..codebook_size`, so `vocab` is
    `codebook_size + 1` and a real code can never be confused with padding. Audio needs this most:
    its codes are `argmax` indices, which start at 0.

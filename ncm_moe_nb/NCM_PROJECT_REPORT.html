@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NCM-MoE Omni: Project Report</title>
+<style>
+  :root {
+    --bg: #fbfaf7; --panel: #ffffff; --ink: #1d2024; --muted: #5d6470; --line: #e2dfd7;
+    --accent: #2f6f6a; --ok: #2c7a4b; --warn: #a35f00; --bad: #a8332a; --info: #2b5c9e;
+    --ok-bg: #e6f3ea; --warn-bg: #fbefd9; --bad-bg: #f8e3e0; --info-bg: #e5edf8; --code-bg: #f1eee6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --panel: #1d2024; --ink: #e7e5df; --muted: #9aa1ab; --line: #31353b;
+      --accent: #6fbdb5; --ok: #6cc28d; --warn: #e0a14a; --bad: #e27d73; --info: #84aee6;
+      --ok-bg: #1d3025; --warn-bg: #3a2c15; --bad-bg: #3a201d; --info-bg: #1c2a3d; --code-bg: #262a30;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 80px; }
+  header h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+  header p { color: var(--muted); margin: 0; }
+  nav { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 20px 0 8px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  nav a { color: var(--accent); text-decoration: none; font-size: .92rem; }
+  nav a:hover { text-decoration: underline; }
+  section { margin-top: 40px; }
+  h2 { font-size: 1.35rem; margin: 0 0 12px; padding-bottom: 6px; border-bottom: 2px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 22px 0 8px; }
+  p, li { max-width: 78ch; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .kpi .v { font-size: 1.5rem; font-weight: 650; }
+  .kpi .l { color: var(--muted); font-size: .85rem; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: .93rem; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-wrap { overflow-x: auto; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 650; padding: 1px 7px; border-radius: 999px; vertical-align: middle; letter-spacing: .03em; }
+  .t-ok { background: var(--ok-bg); color: var(--ok); }
+  .t-warn { background: var(--warn-bg); color: var(--warn); }
+  .t-bad { background: var(--bad-bg); color: var(--bad); }
+  .t-info { background: var(--info-bg); color: var(--info); }
+  .note { border-left: 4px solid var(--warn); background: var(--warn-bg); padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .good { border-left-color: var(--ok); background: var(--ok-bg); }
+  .bad { border-left-color: var(--bad); background: var(--bad-bg); }
+  .bar { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; min-width: 90px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  ul { padding-left: 20px; }
+  footer { margin-top: 56px; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--line); padding-top: 14px; }
+  @media print { nav { display: none; } body { background: #fff; color: #000; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>NCM-MoE Omni: Project Report</h1>
+  <p>A from-scratch Next Concept Modelling notebook: a sparse mixture-of-experts over text, image and audio, predicting whole levels of codes coarse to fine. This report covers what was built, measured, fixed and decided, and what is still unverified.</p>
+  <p style="margin-top:8px">Legend:
+    <span class="tag t-ok">MEASURED</span> from a real run in this project ·
+    <span class="tag t-info">ESTIMATE</span> arithmetic or a projection ·
+    <span class="tag t-warn">UNVERIFIED</span> reasoning not yet tested ·
+    <span class="tag t-bad">PROBLEM</span> a failure or open defect</p>
+</header>
+
+<nav>
+  <a href="#summary">Summary</a><a href="#model">Model</a><a href="#speed">Speed</a><a href="#feed">Data feed</a>
+  <a href="#codecs">Codecs</a><a href="#t0">0.3B run</a><a href="#prev">Earlier 2B runs</a><a href="#t1">T1 run</a><a href="#incidents">Incidents</a>
+  <a href="#open">Open items</a><a href="#files">Files</a>
+</nav>
+
+<section id="summary">
+  <h2>1. Summary</h2>
+  <div class="grid">
+    <div class="kpi"><div class="v">1.68B / ~360M</div><div class="l">total / active parameters (6 experts)</div></div>
+    <div class="kpi"><div class="v">~170 TFLOPS</div><div class="l">real training, current feat codecs (T1 run)</div></div>
+    <div class="kpi"><div class="v">65k codes/s</div><div class="l">T1 run, data-wait 0%</div></div>
+    <div class="kpi"><div class="v">3 / 3</div><div class="l">modalities beat their baseline in the 0.3B-code run</div></div>
+  </div>
+  <div class="card">
+    <ul>
+      <li><b>Speed.</b> On the RTX PRO 6000 the cheap speed knobs are exhausted at about 187-190 TFLOPS in real training (<span class="tag t-ok">MEASURED</span>). The next large lever, FP8, was declined because of the accuracy risk.</li>
+      <li><b>Data feed.</b> The H100 test was feed-bound. The cause was how sources with few shards were split across workers; 12 workers fixed it. The H100 compute sweep was never run (the balance ran out).</li>
+      <li><b>Codecs.</b> The original codecs had weak coarse levels, especially for text. A frozen-feature set (DINOv2 for images, DAC for audio, a data-fit text ladder) was built and checked before training. Image and audio codes carry a lot of learnable structure; text is limited at its coarse levels.</li>
+      <li><b>Learning.</b> After a 0.3B-code run, all three modalities beat their constant-predictor baselines, with caption use missing for image and text. An earlier 2B-size run, with the previous codecs, also beat its baselines at every level (section 6b). The T1 run (2B codes) has finished: text and image LEARNED (image and text now use their caption and prompt), audio PARTIAL because it overfit (section 7).</li>
+      <li><b>Not yet shown.</b> Good generated samples (text is babble, the image check never ran, audio was not judged), caption/prompt following for image and text, and any head-to-head against the old codec under identical settings.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="model">
+  <h2>2. Model and notebook</h2>
+  <table>
+    <tr><th>Piece</th><th>What it is</th></tr>
+    <tr><td>Trunk</td><td>d=1536, 16 layers, GQA 16/4, QK-norm, block-causal attention over levels</td></tr>
+    <tr><td>Experts</td><td>3 modality groups x 2 SwiGLU experts = 6 experts, about 264M each (hidden 3584): about 1.58B in experts plus about 100M trunk</td></tr>
+    <tr><td>Active per token</td><td>about 364M (trunk plus roughly one expert, since two experts take half the tokens each at capacity 0.5)</td></tr>
+    <tr><td>Routing</td><td>Group forced by modality; expert-choice inside the group, per level</td></tr>
+    <tr><td>Ladder</td><td>K=5 levels, ratio 4: text 1/4/16/64/256 slots, image 1/4/16/64/256 (2D grids), audio 2/8/32/128/512; vocabulary 257 (256 codes + NULL)</td></tr>
+    <tr><td>Generation</td><td>K forwards: level 0 sampled first, each next level in one parallel forward. The finest text level predicts all 256 bytes in parallel.</td></tr>
+  </table>
+  <p>The notebook is assembled from <code>src/*.py</code> cells by <code>build_nb.py</code> (order set in <code>run_src.py</code>). All knobs are overridable by <code>NCM_&lt;NAME&gt;</code> environment variables.</p>
+</section>
+
+<section id="speed">
+  <h2>3. Speed work</h2>
+  <h3>3.1 RTX PRO 6000 (95 GB)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Setting / result</th><th class="n">codes/s</th><th class="n">TFLOPS</th><th>Status</th></tr>
+    <tr><td>Best real training: <code>levels</code> attention, <code>flat</code> MoE dispatch, fp32 residual, micro-batch 49152, no activation checkpointing, torch 2.14.1</td><td class="n">72-73k</td><td class="n">187-190</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>Compute benchmark (synthetic batches), micro 32768 / 49152</td><td class="n">75.9k / 77.4k</td><td class="n">193.3 / 197.1</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td><code>max-autotune-no-cudagraphs</code> benchmark</td><td class="n">78.4k</td><td class="n">199.7</td><td><span class="tag t-ok">MEASURED</span> (+1.3%, about 20 min compile)</td></tr>
+    <tr><td>Plain masked SDPA in a real run</td><td class="n">about 13% slower</td><td class="n">-</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>CUDA graphs (<code>reduce-overhead</code>)</td><td class="n">-</td><td class="n">-</td><td><span class="tag t-bad">FAILED</span> with gradient accumulation; dropped</td></tr>
+  </table></div>
+  <p>Profile at the best setting (<span class="tag t-ok">MEASURED</span>): matmul about 50% of time, copies/elementwise about 30% (RMSNorm backward, dtype casts), attention about 9%, SwiGLU about 5%. Peak memory about 69 GiB at micro 49152. A per-layer microbenchmark once picked the wrong attention mode; only whole-step numbers are trusted.</p>
+  <div class="note">Peak-FLOPS figures used for the MFU line (500 TFLOPS for the RTX PRO 6000, 989 for the H100 SXM) are from memory, not checked against datasheets.</div>
+
+  <h3>3.2 H100 SXM pod (RunPod, $4.01/h)</h3>
+  <ul>
+    <li>Pod deployed, notebook built there, <code>HF_TOKEN</code> and checkpoint path handled, but the planned speed sweep was never run: the balance fell to about $1. <span class="tag t-bad">NOT COMPLETED</span></li>
+    <li>First real run was feed-bound: step 10 at 77.8k codes/s and 202 TFLOPS with data-wait 34%, rising to 50% by step 30 (<span class="tag t-ok">MEASURED</span>). A true H100 compute number was never obtained.</li>
+    <li>The pod's host CPU count read 256 while the container limit was about 27 (fixed by reading the cgroup quota).</li>
+  </ul>
+
+  <h3>3.3 The codec cost on the GPU (feat notebook)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Per micro-batch</th><th class="n">44.1 kHz DAC (fp32)</th><th class="n">16 kHz DAC (fp32)</th><th class="n">16 kHz DAC (bf16)</th></tr>
+    <tr><td>Audio encode, seconds</td><td class="n">0.690</td><td class="n">0.262</td><td class="n">0.200</td></tr>
+    <tr><td>Audio model forward+backward, seconds</td><td class="n">0.553</td><td class="n">0.553</td><td class="n">0.553</td></tr>
+    <tr><td>Image encode (DINO), seconds</td><td class="n">0.033</td><td class="n">0.033</td><td class="n">0.033</td></tr>
+    <tr><td>Real throughput</td><td class="n">55.8k codes/s, 145 TFLOPS</td><td class="n">65.3k, 170 TFLOPS</td><td class="n">not run</td></tr>
+  </table></div>
+  <p>All rows are <span class="tag t-ok">MEASURED</span>. The 44.1 kHz audio encoder cost more than the audio model step itself. The 16 kHz DAC model recovered most of the lost throughput. bf16 kept 98-99% of the codes identical to fp32 at every level but would only add about 2% throughput, so fp32 was kept.</p>
+</section>
+
+<section id="feed">
+  <h2>4. Data feed</h2>
+  <div class="note bad"><b>Root cause found in the code (<span class="tag t-bad">PROBLEM</span> then fixed).</b> Each source is split into <code>workers+1</code> parts. A source with fewer Parquet shards than parts (<code>librispeech</code> has 14) fell back to a row filter, where every worker re-reads the whole dataset. With 16 workers that meant 16 workers downloading the same large audio files, giving timeouts and "peer closed connection". 12 workers (13 parts for 14 shards) removed the stall.</div>
+  <table>
+    <tr><th>Observation</th><th>Status</th></tr>
+    <tr><td>12 workers: step 10 at 77.8k codes/s, data-wait 34%, then 47-50% by step 30 (H100)</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>16 workers with the row-filter path: 39k codes/s, data-wait 68%</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>24-32 workers: <code>IndexError: list index out of range</code> for several sources, cause not identified</td><td><span class="tag t-bad">UNRESOLVED</span></td></tr>
+    <tr><td>Shard-aware split for small sources, staggered worker start, jittered retries</td><td><span class="tag t-warn">UNVERIFIED</span> (written, uploaded, not tested at scale)</td></tr>
+    <tr><td>HTTP 503 and "connection reset" lines from huggingface.co throughout every run</td><td>Handled by the library's retries; not a cause of failures</td></tr>
+  </table>
+  <p>Other settings that mattered: <code>HF_TOKEN</code> must be loaded before the kernel starts streaming (a kernel started before the token was written streamed anonymously and stalled), and longer download timeouts (60 s) suit flaky links.</p>
+</section>
+
+<section id="codecs">
+  <h2>5. Codecs: what was tried and what was measured</h2>
+  <p>The model predicts discrete codes, so the codec fixes what is learnable. A diagnostic cell streams a fresh sample and reports, per level: codes used, entropy, how many bits the parent level tells about each level (with a shuffled control), and a small <b>probe</b> net's held-out gain over the unigram. The probe is a rough ceiling on what the big model can win at that level from the previous one.</p>
+
+  <h3>5.1 Original frozen k-means / hash codecs</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Modality</th><th>Result</th><th>Status</th></tr>
+    <tr><td>Image</td><td>PSNR by level 12.3, 13.1, 14.5, 16.2, 19.1 dB (blocky mosaic); parent explains 42% of finest entropy</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>Audio</td><td>Log-mel R&sup2; 0.51 to 0.92 across levels; parent explains 60% of finest entropy (most learnable)</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+    <tr><td>Text (random-hash coarse levels)</td><td>Level 0 uses 34 of 256 codes; parent explains only 7-13% of L1-L3 entropy; coarse levels are close to noise</td><td><span class="tag t-ok">MEASURED</span></td></tr>
+  </table></div>
+
+  <h3>5.2 Learned alternatives</h3>
+  <ul>
+    <li><b>Learned residual image VQ-VAE.</b> 4,000 steps: finest PSNR 21.7 dB, +1.93 dB over k-means, passing the 0.5 dB gate; level-0 perplexity only 19; 430 s for 4,000 steps. The 12,000-step variant was stopped because MSE had flattened (0.0337 against 0.0336). <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Learned text VQ-VAE.</b> Trained in 65 s. Byte accuracy from the coarse codes was 0.162, 0.170, 0.218 at L0-L2 against a 0.160 most-common-byte baseline, and 0.738 at L3, so nearly all information sat in one level. L1-L3 codes were near-uniform noise (parent explained 1%, 1%, 4%), and the commitment loss grew from 0.09 to 4.9. Not adopted. <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Reading of the result.</b> A coarse summary of 4 to 64 bytes carries little reconstructible information, so text coarse levels are inherently weak. <span class="tag t-warn">UNVERIFIED</span> as a general claim.</li>
+  </ul>
+
+  <h3>5.3 Feature codecs (<code>TOKENIZER="feat"</code>)</h3>
+  <p>Frozen DINOv2-base patch features for images, DAC encoder latents for audio, both pooled up the ladder and quantized through a Tree-VQ-style hierarchy over 256 k-means leaves; text uses a data-fit byte-embedding ladder. Two bugs found in the earlier <code>omni</code> implementation were fixed in this port (mixed tree-depth conventions that could not build a tree for more than 256 leaves, and per-sample centering that removed content).</p>
+  <div class="table-wrap"><table>
+    <tr><th>Modality</th><th class="n">Finest-level reconstruction</th><th class="n">Probe gain at L1 / L2 / L3 / L4 (bits)</th><th class="n">Finest-level entropy</th></tr>
+    <tr><td>Image (DINO, tree)</td><td class="n">feature R&sup2; 0.28</td><td class="n">+2.0 / +2.0 / +3.6 / +4.6</td><td class="n">7.91 bits</td></tr>
+    <tr><td>Audio (DAC 44.1 kHz)</td><td class="n">log-mel R&sup2; 0.59</td><td class="n">+0.69 / +0.44 / +1.39 / +2.07</td><td class="n">4.43 bits (perplexity 21.6)</td></tr>
+    <tr><td>Text (data-fit ladder)</td><td class="n">exact bytes at L4</td><td class="n">-0.31 / +0.23 / +1.09 / +1.89</td><td class="n">4.79 bits</td></tr>
+  </table></div>
+  <p>All <span class="tag t-ok">MEASURED</span> on the checks cell. Reading: image and audio codes are strongly predictable from the previous level; text L1 is noise and L2 weak, with the learnable part at L3-L4. The image codec has <b>no pixel decoder</b>, so images cannot be viewed or scored by PSNR with it. The 16 kHz audio codec's check numbers were not captured in the thread.</p>
+  <div class="note"><b>Check-cell bug.</b> The "finest text level decodes exactly" test was wrong (it compared decoded codes with decoded raw bytes, which differ by one). It produced a false HARD failure and was fixed in the source; the notebook copy was run with the gate set to <code>warn</code>.</div>
+</section>
+
+<section id="t0">
+  <h2>6. The 0.3B-code run (feature codecs, 44.1 kHz DAC)</h2>
+  <p>A short run to see whether anything learns. Held-out CE against the constant-predictor baseline at the end (nats, <span class="tag t-ok">MEASURED</span>):</p>
+  <div class="table-wrap"><table>
+    <tr><th>Modality</th><th class="n">Finest-level CE gain</th><th class="n">Probe ceiling</th><th>Result</th></tr>
+    <tr><td>Image</td><td class="n">+3.87 (accuracy 56%, baseline 0.8%)</td><td class="n">+3.20</td><td>Every level beats the baseline except L0 (one code)</td></tr>
+    <tr><td>Audio</td><td class="n">+1.48</td><td class="n">+1.45</td><td>All levels beat the baseline</td></tr>
+    <tr><td>Text</td><td class="n">+1.14</td><td class="n">+1.31</td><td>L2-L4 beat the baseline; L0 and L1 slightly negative. About 87% of its probe ceiling.</td></tr>
+  </table></div>
+  <ul>
+    <li><b>Coarser-level test.</b> Replacing the previous level with random codes raised CE by 4.8 nats (image L4), 5.4 (audio L4) and 2.2-3.1 (text L4). The model reads real structure from the earlier levels. <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Prefix test.</b> Audio uses its transcript (shuffled prefix raises CE by 0.50 at L0 and 0.11 at L1). Image and text barely react (shuffle changes CE by 0.001-0.017 nats), so <b>they do not use the caption/prompt</b>. The check's threshold of 0.01 nats was too lax and printed "uses the prefix"; the true reading is that they ignore it. <span class="tag t-bad">PROBLEM</span></li>
+    <li><b>Training versus held-out.</b> No overfitting for text and image; audio held-out CE was 0.25 above training. <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Samples.</b> Text samples are letter and punctuation fragments with English frequencies and some "the" pieces, no words. Bigram bits per byte: real 3.93, shuffled real 6.27, unigram samples 6.52, model samples 6.20 (barely better than the controls). <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Likelihood in bits per byte.</b> Summing all levels' CE over 256 bytes gives about 5.7 bits per byte against about 5.1 for a unigram byte model, because the four coarse levels add about 2.3 bits per byte of redundant cost. This is arithmetic from the printed table. <span class="tag t-info">ESTIMATE</span></li>
+  </ul>
+</section>
+
+<section id="prev">
+  <h2>6b. Earlier 2B (T1-size) runs with the previous codecs</h2>
+  <div class="note"><b>Partly filled.</b> The evaluation printout of one earlier run was pasted (held-out, teacher-forced, 64 rows, 95% bootstrap intervals). The number of codes seen, the exact codec, and throughput were not part of it, so those cells stay marked unknown. From its content (finest-level image PSNR against raw of 19.97 dB, and a vocoder test that lists "k-means codes") it looks like the k-means codec set, but that is not confirmed.</div>
+  <h3>What is known</h3>
+  <ul>
+    <li>A T1-size (2B live codes) run used the <b>learned residual VQ-VAE tokenizer</b>; its checkpoint folder on Drive is <code>ncm_moe_vq_t1</code> and was left untouched. The notebook's resume check also refers to an older 2B checkpoint made with the <b>k-means codecs</b> in the same Drive folder.</li>
+    <li>The project owner's assessment was that the earlier setup "doesn't learn anything". The evaluation pasted below does not support that on the held-out measures: every one of the 15 (modality, level) pairs beats its constant baseline. What the assessment referred to (for example sample quality, or caption following) is not established in this session. The diagnostics did show weak, near-noise coarse text codes and a source mix that repeated very small audio and image sources many times.</li>
+    <li>The same earlier setup was used for the speed work in section 3 (about 72-73k codes/s, 187-190 TFLOPS on the RTX PRO 6000).</li>
+  </ul>
+  <h3>Comparison table (to fill)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Run</th><th>Codec</th><th class="n">Codes seen</th><th class="n">Text CE / base</th><th class="n">Image CE / base</th><th class="n">Audio CE / base</th><th>Notes</th></tr>
+    <tr><td>Earlier 2B-size run (pasted evaluation)</td><td>probably k-means image/audio, hash text (not confirmed)</td><td class="n">unknown</td><td class="n">2.22 / 3.07</td><td class="n">3.29 / 5.19</td><td class="n">2.05 / 3.78</td><td>means over the 5 levels, my arithmetic from the per-level table below</td></tr>
+    <tr><td>Earlier 2B-size run, gain as a share of baseline</td><td>same run</td><td class="n">&ndash;</td><td class="n">28%</td><td class="n">37%</td><td class="n">46%</td><td><span class="tag t-info">ESTIMATE</span> (gain / baseline, means over levels)</td></tr>
+    <tr><td>Current T1 (feature codecs)</td><td>DINO, DAC 16 kHz, data-fit text</td><td class="n">2B (final)</td><td class="n">3.34 / 4.90</td><td class="n">1.76 / 4.12</td><td class="n">1.78 / 2.52</td><td>section 7 (means over levels; audio rose from 1.52 at 0.73B)</td></tr>
+  </table></div>
+  <p>The fair comparison is the gain over each run's own baseline as a share of that baseline, at the same number of codes seen. Cross-codec CE values are not comparable, and the source weights, learning-rate schedule and audio frame rate also differ between these runs. On that measure the current T1 run at 0.73B codes (text 29%, image 54%, audio 40%) was in the same range as the earlier run (28%, 37%, 46%). At the end of training (text 32%, image 57%, audio 29%) it is ahead on image, slightly ahead on text and behind on audio, where held-out CE rose after step 753. The earlier run's token count is unknown. <b>This does not show that the new codecs made learning much better overall; only image clearly improved.</b> It is indicative only, since the means are unweighted over levels and the two evaluations used different row sets.</p>
+
+  <h3>Earlier run: per-level held-out CE (pasted)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Level</th><th class="n">Audio CE / base / gain / acc</th><th class="n">Image CE / base / gain / acc</th><th class="n">Text CE / base / gain / acc</th></tr>
+    <tr><td>L0</td><td class="n">3.382 / 4.382 / +1.000 / 25.8%</td><td class="n">4.804 / 5.260 / +0.456 / 1.6%</td><td class="n">1.251 / 1.703 / +0.452 / 62.5%</td></tr>
+    <tr><td>L1</td><td class="n">2.274 / 3.754 / +1.481 / 46.9%</td><td class="n">3.440 / 5.309 / +1.869 / 14.1%</td><td class="n">1.677 / 2.221 / +0.544 / 54.9%</td></tr>
+    <tr><td>L2</td><td class="n">2.055 / 3.616 / +1.561 / 53.4%</td><td class="n">3.110 / 5.203 / +2.093 / 19.2%</td><td class="n">2.820 / 3.337 / +0.517 / 30.1%</td></tr>
+    <tr><td>L3</td><td class="n">1.581 / 3.575 / +1.994 / 60.4%</td><td class="n">2.829 / 5.171 / +2.343 / 26.6%</td><td class="n">3.919 / 4.566 / +0.646 / 15.5%</td></tr>
+    <tr><td>L4</td><td class="n">0.961 / 3.563 / +2.602 / 70.6%</td><td class="n">2.248 / 5.000 / +2.752 / 39.6%</td><td class="n">1.429 / 3.509 / +2.080 / 58.1%</td></tr>
+  </table></div>
+  <p>All <span class="tag t-ok">MEASURED</span>. Every level is positive. The text coarse levels have low CE because the old hash codes have few distinct values (cheap to predict), unlike the data-fit text ladder used in the later runs.</p>
+
+  <h3>Earlier run: teacher-forced summary, 64 rows, 95% bootstrap interval</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Measure</th><th class="n">Audio</th><th class="n">Image</th><th class="n">Text (prompt rows)</th><th class="n">Text0 (plain)</th></tr>
+    <tr><td>Bits per code (bytes for text)</td><td class="n">1.661 [1.453, 1.873]</td><td class="n">3.490 [3.261, 3.728]</td><td class="n">3.220 [3.024, 3.422]</td><td class="n">4.327 [4.163, 4.508]</td></tr>
+    <tr><td>Gap, blank prefix minus real (bits)</td><td class="n">1.253 [1.087, 1.453]</td><td class="n">0.462 [0.382, 0.538]</td><td class="n">1.124 [1.021, 1.233]</td><td class="n">&ndash;</td></tr>
+    <tr><td>Gap, shuffled prefix minus real (bits)</td><td class="n">0.112 [0.076, 0.154]</td><td class="n">-0.045 [-0.099, -0.001]</td><td class="n">0.254 [0.205, 0.301]</td><td class="n">&ndash;</td></tr>
+    <tr><td>Reconstruction from the model's codes</td><td class="n">log-mel RMSE 0.759 [0.707, 0.812] (same-code baseline 3.959)</td><td class="n">PSNR 19.87 dB [19.10, 20.64] (same-code baseline 8.04)</td><td class="n">&ndash;</td><td class="n">&ndash;</td></tr>
+    <tr><td>Perplexity per byte, upper bound</td><td class="n">&ndash;</td><td class="n">&ndash;</td><td class="n">9.318</td><td class="n">20.073</td></tr>
+  </table></div>
+  <ul>
+    <li><b>Prefix use.</b> Audio and text depend on the content of their prefix (shuffled gap about 0.11 and 0.25 bits, intervals above zero). Image shows a blank-versus-real gap of 0.46 bits but a shuffled gap of about zero, so it uses the presence of a caption, not what it says. This is a stronger reading of prefix use than my 0.3B-run test gave, which suggests longer training matters, but the two runs used different codecs. <span class="tag t-warn">UNVERIFIED</span></li>
+    <li><b>Codec ceiling for this run.</b> Image PSNR against raw at levels 0 to 4: 14.01, 14.61, 15.71, 17.18, 19.97 dB. Audio finest-level log-mel RMSE against raw: 0.984. The model's own reconstruction (19.87 dB) is therefore essentially at the codec's ceiling.</li>
+    <li><b>Generation metrics (pasted, small samples).</b> WER on 17 audio clips: generated 2.106, real codes through the same codec and vocoder (the ceiling) 4.418, so the vocoder, not the model, limits intelligibility. CLIPScore on 24 images: generated with its caption 0.485 against 0.476 with a wrong caption (gap 0.009), while real images through the codec give 0.523 against 0.465 (gap 0.058). Generated images are therefore only weakly caption-aligned.</li>
+    <li><b>Vocoder test.</b> Self-consistency error against the target mel: unquantised mel 0.538 (Griffin-Lim 60) and 0.535 (300); k-means codes 0.431 and 0.423. More Griffin-Lim iterations barely help.</li>
+    <li><b>Text samples</b> from this run are letter and punctuation fragments, like the later runs, with no words.</li>
+    <li><b>Bits per byte.</b> This run's text0 bound of 4.33 bits per byte is below my rough 5.7 estimate for the 0.3B feature-codec run (section 6). A possible reason is that the old hash codes cost very few bits at the coarse levels while the data-fit ladder's coarse codes carry about 7.7 bits each; this is a hypothesis, and the two runs differ in tokens seen. <span class="tag t-warn">UNVERIFIED</span></li>
+  </ul>
+  <p>The printed model summary shows the same architecture as the current notebook (embeddings and position tables of 682, 341 and 341 positions, 16 blocks with three modality expert groups, 257-way heads), so the runs are comparable in model, not in codec.</p>
+</section>
+
+<section id="t1">
+  <h2>7. The T1 run (2B codes, 16 kHz DAC)</h2>
+  <p>Setup: <code>TIER=T1</code>, <code>TOKENS=0</code> (taken from the tier), checkpoints to <code>MyDrive/ncm_feat_t1</code> every 30 minutes, 12 workers, evals every 0.25B codes. The run completed (2,006 steps). Throughput held at about 65k codes/s and 170 TFLOPS with data-wait 0%, apart from brief dips. Interim evals and the final evaluation follow.</p>
+  <div class="table-wrap"><table>
+    <tr><th>Eval at</th><th class="n">Text CE</th><th class="n">Image CE</th><th class="n">Audio CE</th></tr>
+    <tr><td>Step 251 (0.24B)</td><td class="n">4.07</td><td class="n">2.08</td><td class="n">1.60</td></tr>
+    <tr><td>Step 502 (0.49B)</td><td class="n">3.59</td><td class="n">1.96</td><td class="n">1.55</td></tr>
+    <tr><td>Step 753 (0.73B)</td><td class="n">3.49</td><td class="n">1.90</td><td class="n">1.52</td></tr>
+    <tr><td><b>Baseline</b></td><td class="n">4.90</td><td class="n">4.12</td><td class="n">2.52</td></tr>
+  </table></div>
+  <p>All <span class="tag t-ok">MEASURED</span> (means over levels). Gain over baseline at step 753: text 1.41 nats (29%), image 2.22 (54%), audio 1.00 (40%). Train loss 1.64, gradient norm about 0.13. Text, which sat at its baseline in the 0.3B run, is now clearly below it. Periodic throughput dips to 11-35k codes/s coincide with checkpoint writes, evals or data workers reopening sources.</p>
+  <h3>Final evaluation (end of the run)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Level</th><th class="n">Text CE / base / gain / acc</th><th class="n">Image CE / base / gain / acc</th><th class="n">Audio CE / base / gain / acc</th></tr>
+    <tr><td>L0</td><td class="n">4.339 / 5.128 / +0.790 / 8.6%</td><td class="n">2.361 / 2.795 / +0.434 / 31.2%</td><td class="n">0.653 / 1.025 / +0.372 / 79.7%</td></tr>
+    <tr><td>L1</td><td class="n">3.808 / 5.280 / +1.472 / 11.1%</td><td class="n">1.930 / 3.441 / +1.511 / 44.9%</td><td class="n">1.465 / 2.158 / +0.693 / 56.2%</td></tr>
+    <tr><td>L2</td><td class="n">4.029 / 5.345 / +1.316 / 15.3%</td><td class="n">1.726 / 4.107 / +2.381 / 51.5%</td><td class="n">1.794 / 2.669 / +0.875 / 57.4%</td></tr>
+    <tr><td>L3</td><td class="n">3.777 / 5.246 / +1.470 / 19.5%</td><td class="n">1.482 / 4.783 / +3.301 / 57.1%</td><td class="n">2.501 / 3.175 / +0.674 / 52.2%</td></tr>
+    <tr><td>L4</td><td class="n">0.727 / 3.505 / +2.778 / 77.3%</td><td class="n">1.297 / 5.477 / +4.180 / 63.1%</td><td class="n">2.462 / 3.562 / +1.101 / 57.6%</td></tr>
+  </table></div>
+  <p>All <span class="tag t-ok">MEASURED</span>. Every level of every modality beats its baseline. The model's gain at the finest level is above the probe ceiling for text (+2.78 against +1.32) and image (+4.18 against +3.16), as expected since the probe sees only the parent level, and <b>below</b> it for audio (+1.10 against +1.56).</p>
+  <ul>
+    <li><b>Prefix use.</b> Shuffling the prefix raises CE by [2.54, 0.55, 0.30, 0.17, 0.06] nats per level for text, [0.82, 0.53, 0.29, 0.07, 0.01] for image and [0.75, 0.75, 0.29, 0.13, 0.02] for audio. So text now uses its prompt and image its caption, mostly at the coarse levels, which was not the case in the 0.3B-code run. For audio, the blank prefix (1.782) is no worse than the true one (1.775) while a wrong one hurts (2.166), so how much it uses the transcript's content is unclear. <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Coarser-level test.</b> Random previous-level codes raise CE by up to 6.5 (text), 4.5 (image) and 6.3 (audio) nats at L4. All modalities read the earlier levels. <span class="tag t-ok">MEASURED</span></li>
+    <li><b>Overfitting in audio.</b> Training CE 1.001 against held-out 1.775 (gap +0.774); text (-0.104) and image (+0.058) show none. Audio's mean held-out CE was 1.52 at step 753 and is 1.78 at the end, while text improved from 3.49 to 3.34 and image from 1.90 to 1.76. Audio therefore got worse on held-out data during the second half of training. The saved checkpoint is overwritten every 30 minutes, so it is the late, overfit model; where audio peaked is not known without the intermediate eval lines. The cause (limited distinct audio data, source weights, clip filtering) was not diagnosed. <span class="tag t-bad">PROBLEM</span></li>
+    <li><b>Verdict printed by the notebook:</b> text LEARNED, image LEARNED, audio PARTIAL (overfitting); 2 of 3 modalities.</li>
+    <li><b>Share of baseline at the end</b> (gain over baseline CE, means over levels, my arithmetic): text 32%, image 57%, audio 29%. <span class="tag t-info">ESTIMATE</span></li>
+  </ul>
+  <div class="note"><b>No causal claim about the codec.</b> The T1 numbers cannot be compared with older runs by CE, since each codec has its own targets, and several things changed together (codecs, source weights, audio frame rate, learning-rate schedule). Showing that the new codecs help would take a controlled run with only the codec changed.</div>
+</section>
+
+<section id="incidents">
+  <h2>8. Incidents and fixes</h2>
+  <div class="table-wrap"><table>
+    <tr><th>What happened</th><th>Cause</th><th>Outcome</th></tr>
+    <tr><td>Training stall (600 s timeout) on the pod</td><td>Row-filter split for small sources plus anonymous streaming</td><td>Fixed: 12 workers, token loaded before the kernel starts</td></tr>
+    <tr><td>Out of memory at step 2 on a 95 GB card</td><td>DAC encoded a whole micro-batch at 44.1 kHz in fp32 next to the training memory</td><td>Fixed: encode in chunks of 8 clips</td></tr>
+    <tr><td>CUDA device-side assert in the generation check</td><td>Model sampled a level-2 code above the 64 codes that level has; indexing the prototype table went out of range</td><td>Fixed in source (clamp); the live kernel needed a restart</td></tr>
+    <tr><td>False "text not exact" hard failure</td><td>Check compared decoded codes with decoded raw bytes (off by one)</td><td>Fixed in source; gate set to <code>warn</code> in the notebook</td></tr>
+    <tr><td>Training history and unigram baselines wiped</td><td>The wrong cell was run while editing the open notebook (training cell started, interrupted within seconds)</td><td>Model weights unchanged (CE identical before and after); the next report used the held-out entropy as baseline until a fresh run</td></tr>
+    <tr><td>"Did it learn" verdict too strict</td><td>Top-1 accuracy required to beat a skewed unigram (silence); unweighted mean over levels</td><td>Changed to CE gain plus a slot-weighted gain</td></tr>
+    <tr><td>First 0.3B run left nothing to resume</td><td><code>CKPT_DIR</code> was empty</td><td>T1 run writes checkpoints to Drive</td></tr>
+  </table></div>
+</section>
+
+<section id="open">
+  <h2>9. Open items and caveats</h2>
+  <ul>
+    <li><span class="tag t-warn">UNVERIFIED</span> Generation quality: the image retrieval check never ran; audio was generated but not judged by ear; text is babble at 0.3B codes.</li>
+    <li><span class="tag t-ok">RESOLVED</span> Image and text ignored the caption / prompt in the 0.3B-code run; in the finished T1 run both use it, mostly at the coarse levels (section 7). Whether generations follow captions is not checked, and the DINO image codec cannot be decoded to look at.</li>
+    <li><span class="tag t-bad">PROBLEM</span> Audio overfits in the T1 run (training CE 1.00 against held-out 1.78, and held-out CE rose after step 753). The cause is undiagnosed; possible directions, all untested, are more distinct audio data or a different source mix, stronger regularization, and keeping the best held-out checkpoint instead of overwriting one file.</li>
+    <li><span class="tag t-bad">PROBLEM</span> The prefix-use check threshold (0.01 nats) is too lax; about 0.05 would be more honest.</li>
+    <li><span class="tag t-bad">PROBLEM</span> Text coarse levels are close to noise with every text codec tried; the finest level is predicted in parallel with no byte-to-byte dependence. Likely the cap on text quality. Options (all unbuilt): semantic coarse codes from a pretrained model, strided subsampling levels, or an autoregressive text path.</li>
+    <li><span class="tag t-warn">UNVERIFIED</span> Worker counts above 16 and the shard-aware split; the cause of the <code>IndexError</code> at 24-32 workers.</li>
+    <li><span class="tag t-warn">UNVERIFIED</span> DINO has no decoder, so image quality cannot be seen. The learned VQ image codec reaches about 21.7 dB, which is still blurry (the 8-bit-per-patch budget is the ceiling).</li>
+    <li><span class="tag t-info">ESTIMATE</span> Larger tiers on the same hardware: T2 (20B codes) about 4 days, T3 (50B) about 10 days at 56-65k codes/s; Colab units and the pod balance do not cover them.</li>
+    <li>H100 compute sweep, FP8, and the idea of doubling the image expert width (about 2.2B total, roughly a 25% throughput cost) were not done; the width change is only worth trying if image capacity turns out to be the limit.</li>
+    <li>Papers: the codec doc cites many arXiv papers; only the Next-Concept Modeling abstract (arXiv:2610.14162, a text-only multiscale residual VQ-VAE) was opened. None of the cited numbers were checked.</li>
+  </ul>
+</section>
+
+<section id="files">
+  <h2>10. Files (under <code>ncm_moe_nb/</code>)</h2>
+  <div class="table-wrap"><table>
+    <tr><th>File</th><th>Role</th></tr>
+    <tr><td><code>src/06b_feat_codecs.py</code></td><td>Feature codecs: DINOv2 image, DAC audio (chunked encode), text options, tree hierarchy, codec fit and cache</td></tr>
+    <tr><td><code>src/07d_codec_checks.py</code></td><td>Contract, usage and learnability checks with a gate, before the model is built</td></tr>
+    <tr><td><code>src/12b_learned.py</code></td><td>"Did it learn": per-level gain, prefix test, coarser-level test, train/held-out gap, verdict</td></tr>
+    <tr><td><code>src/13b_gencheck.py</code></td><td>Text bigram check and image retrieval check (clamp fix included)</td></tr>
+    <tr><td><code>src/07_data.py</code>, <code>src/07b_shards.py</code></td><td>Shard-aware source split, staggered start, jittered retries, rebalanced source weights, shard watchdog guard</td></tr>
+    <tr><td><code>src/01_setup.py</code>, <code>02_hardware.py</code>, <code>03_spec.py</code></td><td>Environment detection, cgroup-aware CPU count, defaults (12 workers, tokenizer <code>feat</code>), peak-FLOPS table</td></tr>
+    <tr><td><code>src/06_codecs.py</code>, <code>07c_stage.py</code>, <code>10_correct.py</code>, <code>13_generate.py</code></td><td>Hooks for the new codecs (state, fit, resume, round-trip checks, generation guard)</td></tr>
+    <tr><td><code>run_src.py</code>, <code>build_nb.py</code>, <code>tune_extra.py</code></td><td>Cell order, notebook builder, hands-off speed sweep for a new GPU</td></tr>
+    <tr><td><code>RUNPOD.md</code>, <code>FEAT_CODECS.md</code></td><td>Pod runbook; feature-codec runbook with knobs and limits</td></tr>
+  </table></div>
+  <p>The notebook was built to <code>~/Downloads/NCM_MoE_Omni_Feat.ipynb</code>. Several later edits (DAC chunk patch, the 16 kHz DAC setting, T1 defaults, Drive mount) were made directly in the Colab copy and are not all in the source files, so rebuild from <code>src/</code> to pick up the source-side fixes.</p>
+</section>
+
+<footer>
+  Generated from the project conversation. Numbers marked MEASURED were pasted from real runs; ESTIMATE items are arithmetic on those numbers; UNVERIFIED items are reasoning that was not tested. Nothing in this report was run on the author's machine apart from the notebook build.
+</footer>
+
+</div>
+</body>
+</html>

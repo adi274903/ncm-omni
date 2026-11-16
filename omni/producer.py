@@ -139,6 +139,33 @@ def _img_cap(ex):
     return {"image": img, "text": str(cap)} if cap else {"image": img}
 
 
+def _scienceqa(ex):
+    """ScienceQA: an image with a multiple-choice question whose answer indexes `choices`.
+
+    `_img_text` would caption the image with the question alone and throw the options away, and the
+    answer is an index, not a string - so the pair has to be assembled here.
+    """
+    img = ex.get("image")
+    if img is None:
+        return {}
+    q = ex.get("question")
+    q = q.strip() if isinstance(q, str) else ""
+    ch = ex.get("choices") if isinstance(ex.get("choices"), list) else []
+    a = ex.get("answer")
+    text = q
+    if q and ch:
+        opts = "\n".join(f"{chr(65 + i)}. {c}" for i, c in enumerate(ch) if isinstance(c, str))
+        ans = ch[a] if isinstance(a, int) and 0 <= a < len(ch) else ""
+        text = f"{q}\n{opts}" + (f"\nAnswer: {ans}" if ans else "")
+    if not text:
+        for k in ("solution", "lecture", "hint"):
+            v = ex.get(k)
+            if isinstance(v, str) and v.strip():
+                text = v.strip()
+                break
+    return {"image": img, "text": text} if text else {"image": img}
+
+
 def _decode_audio(a):
     """(raw bytes|path|already decoded) -> (float32 mono, sr). None means drop the sample."""
     if isinstance(a, dict):
@@ -239,6 +266,12 @@ SOURCES = {
     "text_code":        (_stream("codeparrot/codeparrot-clean"), _two("content")),
     "text_code_inst":   (_stream("ise-uiuc/Magicoder-OSS-Instruct-75K"),
                          _two("problem", "solution")),
+    # --- physics / chemistry / math instruction corpora
+    # `message_1` / `message_2` are the question and the worked answer: `_txt` finds no `text` key
+    # on these and would silently yield nothing, which is why `_two` exists.
+    "text_physics":     (_stream("camel-ai/physics"), _two("message_1", "message_2")),
+    "text_chemistry":   (_stream("camel-ai/chemistry"), _two("message_1", "message_2")),
+    "text_math_inst":   (_stream("camel-ai/math"), _two("message_1", "message_2")),
     # --- vision
     "image_docvqa":     (_s("HuggingFaceM4/DocumentVQA"), _img_text()),
     "image_imagenet":   (_s("evanarlian/imagenet_1k_resized_256"), _img_text()),
@@ -246,6 +279,10 @@ SOURCES = {
     "image_wikiart":    (_s("huggan/wikiart"), _img_text(cap_keys=("artist", "style", "genre"))),
     "image_flowers":    (_s("nelorth/oxford-flowers"), _img_text()),
     "image_food":       (_s("ethz/food101"), _img_text()),
+    # --- math / science figures. `_img_text` is wrong for both: LaTeX_OCR's `text` is a LaTeX
+    # transcription with no spaces, and ScienceQA's answer is an index into `choices`.
+    "image_latex":      (_s("linxy/LaTeX_OCR"), _img_text(img_keys=("image",), cap_keys=("text",))),
+    "image_scienceqa":  (_s("derek-thomas/ScienceQA"), _scienceqa),
     # --- audio (always decode=False + soundfile)
     "audio_libri":      (_raw("openslr/librispeech_asr", "clean", "train.100",
                               column="audio"), _audio_text),
@@ -261,9 +298,11 @@ SOURCES = {
 }
 GROUPS = {k: "text" for k in ("text_fineweb", "text_cosmopedia", "text_wikipedia",
                               "text_math_web", "text_math_fine", "text_math_numina",
-                              "text_arxiv", "text_code", "text_code_inst")}
+                              "text_arxiv", "text_code", "text_code_inst",
+                              "text_physics", "text_chemistry", "text_math_inst")}
 GROUPS.update({k: "image" for k in ("image_docvqa", "image_imagenet", "image_coco",
-                                    "image_wikiart", "image_flowers", "image_food")})
+                                    "image_wikiart", "image_flowers", "image_food",
+                                    "image_latex", "image_scienceqa")})
 GROUPS.update({k: "audio" for k in ("audio_libri", "audio_libritts", "audio_fleurs",
                                     "audio_peoples")})
 GROUPS["video_ucf"] = "video"
@@ -344,9 +383,15 @@ class Source:
 
 
 # ------------------------------------------------------------------ encoding
-def make_codecs(sched, V, prefer_real=True):
-    return {m: build_codec(m, sched.K, sched.R, V, sched.base_len[m], prefer_real)
+def make_codecs(sched, V, prefer_real=True, tier="auto"):
+    """One codec per modality at the configured tier. `tier` is recorded in every shard's meta."""
+    return {m: build_codec(m, sched.K, sched.R_of(m), V, sched.base_len[m], prefer_real, tier)
             for m in MODALITIES}
+
+def codec_report(codecs):
+    """{modality: (name, tier, note)} - the line a reader needs to know what the codes ARE."""
+    return {m: (codecs[m].name, getattr(codecs[m], "tier", "standin"),
+                getattr(codecs[m], "note", "")) for m in MODALITIES}
 
 
 def encode_sample(codecs, sched, parts):
@@ -409,10 +454,13 @@ def run(cfg, selfcheck=False):
     sched = OmniSchedule(base_len=cfg["base_len"], K=cfg["K"], R=cfg["R"],
                          null_code=cfg.get("null_code", 0))
     V = cfg["codebook_size"]
-    codecs = make_codecs(sched, V, cfg.get("prefer_real", True))
+    tier = cfg.get("codec_tier", "auto")
+    codecs = make_codecs(sched, V, cfg.get("prefer_real", True), tier)
     meta = schedule_meta(sched, codecs, V)
     log(sched.describe())
-    log("codecs:", {m: codecs[m].name for m in MODALITIES})
+    log(f"codec tier requested: {tier}")
+    for m, (name, won, note) in codec_report(codecs).items():
+        log(f"  {m:5s} {name:20s} tier={won:8s} {note}")
 
     if selfcheck:
         # Every modality, with synthetic objects only: no network, no dataset ids. What is being

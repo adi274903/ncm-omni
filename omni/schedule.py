@@ -14,7 +14,7 @@ see the whole level-k block (every modality) but nothing finer. That single line
 is the entire omni thesis; `cross_level=True` turns it into the ablation.
 """
 from dataclasses import dataclass, field
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence, Tuple, Union
 
 import torch
 
@@ -27,24 +27,71 @@ MODALITIES = ("text", "image", "audio")
 class OmniSchedule:
     base_len: Dict[str, int]                 # finest-level length per modality
     K: int = 6
-    R: int = 2
+    R: Union[int, Dict[str, int]] = 2         # one ratio for all modalities, or {m: ratio}
     null_code: int = 0                       # reserved in every modality's codebook
     modalities: Tuple[str, ...] = MODALITIES
     prefix_len: int = 0
 
     def __post_init__(self):
-        assert self.R >= 2 and self.K >= 1
+        assert self.K >= 1
+        # `R` is either one ratio for every modality or `{m: ratio}`. It is resolved ONCE into
+        # `self.Rm`; `self.R` is left exactly as given, so serialisation, shard meta and old
+        # cfgs round-trip unchanged.
+        self.Rm = self._resolve_R(self.R)
         for m in self.modalities:
             assert m in self.base_len, m
+            assert self.Rm[m] >= 2, (m, self.Rm[m])
         # level 0 is the COARSEST (short) and level K-1 the finest (== base_len), so lengths must
         # be non-decreasing in k. Getting this direction wrong is exactly what `check` caught.
         for m in self.modalities:
             lens = self.level_lens(m)
             assert all(a <= b for a, b in zip(lens, lens[1:])), (m, lens)
 
+    def _resolve_R(self, R):
+        """int -> {m: int}; {m: int} -> completed for every modality. A missing ratio is an error,
+        never a silent default: a modality quietly using another's R is a ladder nobody chose."""
+        # `base_len` may name a modality that `modalities` deliberately excludes (video is
+        # data-path only): `level_len("video", k)` must still resolve, as it always has.
+        extra = [m for m in self.base_len if m not in self.modalities]
+        if isinstance(R, dict):
+            missing = [m for m in self.modalities if m not in R]
+            if missing:
+                raise KeyError(f"R is a per-modality dict but has no ratio for {missing}")
+            return {m: int(R[m]) for m in list(self.modalities) + extra}
+        r = int(R)
+        return {m: r for m in list(self.modalities) + extra}
+
+    def R_of(self, m: str) -> int:
+        """This modality's compression ratio. Codecs get the scalar, never `self.R`."""
+        return self.Rm[m]
+
+    def ladder_report(self, min_level0: int = 8) -> Tuple[list, list]:
+        """-> (rows, warnings). `warnings` names every modality whose coarsest level is too short.
+
+        A level-0 code that must stand for a whole sample carries almost nothing, and nothing
+        downstream can learn it. Measured on the K=5/R=4 text ladder (1/4/16/64/256 slots):
+        level 0 is ONE code for 256 bytes and the probe gain at the next level is -0.31 bits,
+        i.e. worse than a shuffled control. That is a ladder defect, not a model defect, so it
+        is reported before a run rather than diagnosed after one.
+        """
+        rows, warn = [], []
+        for m in self.modalities:
+            lens = self.level_lens(m)
+            span = round(self.base_len[m] / max(1, lens[0]))
+            rows.append(f"{m:6s} R={self.Rm[m]} base={self.base_len[m]:5d} levels={lens} "
+                        f"(L0: 1 code per {span} units)")
+            if lens[0] < min_level0:
+                need = min_level0 * self.Rm[m] ** (self.K - 1)
+                warn.append(f"{m}: level 0 has {lens[0]} slot(s) for {self.base_len[m]} units "
+                            f"(1 code per {span}) - below {min_level0}. A spatially "
+                            f"redundant modality can tolerate one slot; a sequential one "
+                            f"cannot. Fix with a lower ratio for this modality "
+                            f"(--r \"{m}=2\") or base_len >= {need}.")
+        return rows, warn
+
     # ---------------------------------------------------------------- geometry
     def level_len(self, m: str, k: int) -> int:
-        return max(1, round(self.base_len[m] / self.R ** (self.K - 1 - k)))
+        return max(1, round(self.base_len[m] / self.Rm[m] ** (self.K - 1 - k)))
 
     def level_lens(self, m: str) -> Tuple[int, ...]:
         return tuple(self.level_len(m, k) for k in range(self.K))
@@ -116,9 +163,12 @@ class OmniSchedule:
                                  KV_LEN=self.total_len, device=device)
 
     def describe(self) -> str:
-        rows = []
-        for m in self.modalities:
-            rows.append(f"{m:6s} base={self.base_len[m]:4d} levels={self.level_lens(m)}")
+        rows, warn = self.ladder_report()
         tot = {m: self.flat_len(m) for m in self.modalities}
-        return ("K=%d R=%d  total packed positions=%d\n" % (self.K, self.R, self.total_len)
-                + "\n".join(rows) + f"\nper-sample token counts {tot}")
+        r = ("uniform %d" % self.R) if not isinstance(self.R, dict) else "per-modality"
+        out = ("K=%d R=%s  total packed positions=%d\n" % (self.K, r, self.total_len)
+               + "\n".join(rows) + f"\nper-sample token counts {tot}")
+        if warn:
+            out += "\n!! DEGENERATE LEVEL 0 (nothing learnable lives there):\n   " + \
+                   "\n   ".join(warn)
+        return out

@@ -37,6 +37,29 @@ PRESETS = {
 }
 
 
+def _parse_r(spec):
+    """'2' -> 2; 'text=2,image=4,audio=4' -> {'text': 2, 'image': 4, 'audio': 4}.
+
+    Per-modality R is what lets text have a coarse-safe ladder (R=2) while image and audio
+    keep R=4. The shared ratio is what gave text ONE level-0 code for 256 bytes in the K=5/R=4
+    ladder, and a level-0 code that stands for the whole sample carries nothing learnable.
+    """
+    from omni.schedule import MODALITIES          # local: this module imports lazily
+    spec = str(spec).strip()
+    if "=" not in spec:
+        return int(spec)
+    out = {}
+    for part in spec.split(","):
+        if not part.strip():
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip().lower()
+        if k not in MODALITIES:
+            raise SystemExit(f"--r: unknown modality {k!r}; pick from {MODALITIES}")
+        out[k] = int(v)
+    return out
+
+
 def apply_overrides(cfg, a):
     """Preset dims, schedule length, eval-set size. Every command goes through here, because
     each one rewrites run/cfg/*.json - a mismatch between produce and train would silently
@@ -63,6 +86,16 @@ def apply_overrides(cfg, a):
         # video stays at 32: its base_len is frames x grid^2, so 512 would read 128 frames of
         # every clip. It is data-path only and currently dead in eval, so it is not worth the
         # decode. Raise it in build_codec if that ever changes.
+    rspec = getattr(a, "r", None)
+    if rspec:
+        rs = _parse_r(rspec)
+        if isinstance(rs, dict):
+            cur = cfg["sched"]["R"]
+            merged = dict(cur) if isinstance(cur, dict) else {}
+            merged.update(rs)
+            cfg["sched"]["R"] = merged
+        else:
+            cfg["sched"]["R"] = rs
     moe = getattr(a, "moe", 0)
     if moe:
         cfg["model"]["n_experts"] = int(moe)
@@ -119,14 +152,25 @@ def default_cfg(budget=20000, out=os.path.join(RUN, "stream")):
                      # each, audio 3024, so equal shares would not be equal codes. At the old 60/20/20
                      # the image expert was the binding constraint and the whole run had to be 1.83x
                      # larger to give it its tokens.
-                     mix=dict(text_fineweb=0.0832, text_cosmopedia=0.0486, text_wikipedia=0.0278,
-                              text_math_web=0.0486, text_math_fine=0.0417, text_math_numina=0.0347,
-                              text_arxiv=0.0417, text_code=0.0625, text_code_inst=0.0278,
-                              image_docvqa=0.1042, image_imagenet=0.1042, image_coco=0.0833,
-                              image_wikiart=0.0625, image_flowers=0.0417, image_food=0.0208,
+                     # Physics, chemistry and a second math-instruction source were carved OUT of
+                     # their own modality rather than added on top: text still totals 0.4166 and
+                     # image 0.4167, so the 41.7/41.7/16.7 sample budget - and with it the equal
+                     # live-codes-per-modality argument above - is unchanged. Every pre-existing
+                     # text source is scaled by 0.875, every pre-existing image source by 0.850.
+                     mix=dict(text_fineweb=0.0728, text_cosmopedia=0.0425, text_wikipedia=0.0243,
+                              text_math_web=0.0425, text_math_fine=0.0365, text_math_numina=0.0304,
+                              text_arxiv=0.0365, text_code=0.0547, text_code_inst=0.0243,
+                              text_physics=0.0208, text_chemistry=0.0208, text_math_inst=0.0104,
+                              image_docvqa=0.0886, image_imagenet=0.0886, image_coco=0.0708,
+                              image_wikiart=0.0531, image_flowers=0.0354, image_food=0.0177,
+                              image_latex=0.0208, image_scienceqa=0.0417,
                               audio_libri=0.0625, audio_libritts=0.0417, audio_fleurs=0.0417,
                               audio_peoples=0.0208),
-                     codebook_size=256, prefer_real=True,
+                     # "auto" = learned codec where this machine can build one (text: always,
+                     # image: needs a k-means codebook file, audio: needs descript-audio-codec),
+                     # otherwise the stand-in. The winner and the reason land in every shard's
+                     # meta, so a run can never be mislabelled later. See docs/codecs.md.
+                     codebook_size=256, prefer_real=True, codec_tier="auto",
                      K=None, R=None, base_len=None),
     )
 
@@ -484,6 +528,12 @@ def build_parser():
     ap.add_argument("--base-len", type=int, default=0,
                     help="text/image finest length; audio scales x1.5, video stays 32; "
                          "0 keeps 64 (504 packed positions). 1024 => ~7.1k positions")
+    ap.add_argument("--r", default=None,
+                    help="compression ratio: one int for every modality, or "
+                         "'text=2,image=4,audio=4'. Level k = base_len / R**(K-1-k), so a "
+                         "modality whose level 0 is one code for the whole sample (K=5,R=4 "
+                         "text) has nothing learnable there. `check` prints the ladder and "
+                         "warns when that happens.")
     ap.add_argument("--holdout-mult", type=int, default=0,
                     help="multiply the held-out block sizes (4 => 128/96/64/32, SE ~0.028)")
     ap.add_argument("--batch", type=int, default=0,
